@@ -1,23 +1,22 @@
 // ====================================================
-// index.js — CRM Table Scraper (paginates through all pages)
+// index.js — CRM Live Data Sync (auto-detects the correct filter to see ALL customers)
 // Deploy on Railway
 // ====================================================
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const {
   CRM_USERNAME,
   CRM_PASSWORD,
   CRM_LOGIN_URL,
   CRM_LIST_PAGE_URL,
+  CRM_DATA_API_URL,
   GOOGLE_SHEET_ID,
   GOOGLE_CREDENTIALS,
 } = process.env;
 
-const required = ['CRM_USERNAME', 'CRM_PASSWORD', 'CRM_LOGIN_URL', 'CRM_LIST_PAGE_URL', 'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'];
+const required = ['CRM_USERNAME', 'CRM_PASSWORD', 'CRM_LOGIN_URL', 'CRM_LIST_PAGE_URL', 'CRM_DATA_API_URL', 'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'];
 for (const v of required) {
   if (!process.env[v]) {
     console.error(`Missing environment variable: ${v}`);
@@ -40,10 +39,7 @@ const sheets = google.sheets({ version: 'v4', auth });
 
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
-const ACTIVATION_OFFSET_DAYS = 30; // Activation/Payment Date = Expiry - 30 days, per instruction
 
-// Edit this list to match your real package names and prices.
-// The Package column text is matched against these keys (case-insensitive).
 const PACKAGE_PRICES = {
   '7+7Mbps': 2200,
   '3+3Mbps': 1700,
@@ -56,7 +52,6 @@ const PACKAGE_PRICES = {
   '50 MB': 8500,
   'default': 0,
 };
-
 function getPriceForPackage(pkg) {
   if (!pkg) return PACKAGE_PRICES.default || 0;
   if (PACKAGE_PRICES[pkg] !== undefined) return PACKAGE_PRICES[pkg];
@@ -67,7 +62,6 @@ function getPriceForPackage(pkg) {
   return PACKAGE_PRICES.default || 0;
 }
 
-// ---------- Helpers ----------
 function stripHtml(str) {
   if (!str) return '';
   return String(str).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -108,127 +102,78 @@ function computeStatus(expiryDate, today) {
   return { status, daysRemaining: diffDays };
 }
 
-// ---------- Find the right table AND map its columns by header text ----------
-async function findTableAndColumnMap(page) {
-  return await page.evaluate(() => {
-    const tables = Array.from(document.querySelectorAll('table'));
-    let best = null;
-    let bestScore = -Infinity;
-    let bestHeaders = [];
+function extractRecord(row) {
+  // Confirmed field positions from the real CRM API response:
+  // 2=Username(code), 3=Name, 5=Phone, 6=Address, 7=Package, 14=Expiry, 21=Created
+  const username = stripHtml(row[2]);
+  const name = stripHtml(row[3]);
+  const phone = stripHtml(row[5]);
+  const address = stripHtml(row[6]);
+  const pkg = stripHtml(row[7]);
+  const activationDate = parseCrmDate(row[21]);
+  const expiryDate = parseCrmDate(row[14]);
+  return { username, name, phone, address, pkg, activationDate, expiryDate };
+}
 
-    for (const table of tables) {
-      const headerCells = table.querySelectorAll('thead th, tr:first-child th, tr:first-child td');
-      const headers = Array.from(headerCells).map((c) => c.innerText.trim());
-      if (headers.length < 5) continue;
+function buildRequestBody(start, length, filterType) {
+  const orderableColumns = new Set([0, 2, 3, 4, 5, 6, 7]);
+  const params = new URLSearchParams();
+  params.append('draw', '1');
+  for (let i = 0; i <= 22; i++) {
+    params.append(`columns[${i}][data]`, String(i));
+    params.append(`columns[${i}][name]`, '');
+    params.append(`columns[${i}][searchable]`, 'true');
+    params.append(`columns[${i}][orderable]`, orderableColumns.has(i) ? 'true' : 'false');
+    params.append(`columns[${i}][search][value]`, '');
+    params.append(`columns[${i}][search][regex]`, 'false');
+  }
+  params.append('order[0][column]', '0');
+  params.append('order[0][dir]', 'desc');
+  params.append('start', String(start));
+  params.append('length', String(length));
+  params.append('search[value]', '');
+  params.append('search[regex]', 'false');
+  params.append('filterType', String(filterType));
+  params.append('dashboardUserTables', '1');
+  return params.toString();
+}
 
-      const lower = headers.map((h) => h.toLowerCase());
-      const hasName = lower.some((h) => h.includes('name'));
-      const hasPhone = lower.some((h) => h.includes('phone') || h.includes('mobile'));
-      const hasAddress = lower.some((h) => h.includes('address'));
-      const hasExpiry = lower.some((h) => h.includes('expiry') || h.includes('expire'));
-      const hasAction = lower.some((h) => h.includes('action'));
+async function callDataApi(page, body) {
+  return await page.evaluate(async (url, b) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: b,
+    });
+    return res.json();
+  }, CRM_DATA_API_URL, body);
+}
 
-      let score = 0;
-      if (hasName) score += 10;
-      if (hasPhone) score += 10;
-      if (hasAddress) score += 10;
-      if (hasExpiry) score += 10;
-      score += headers.length;
-      if (hasAction && !hasName) score -= 30;
+// Try several filterType values and pick whichever returns the most records
+async function findBestFilterType(page) {
+  const candidates = [0, 1, 2, 3, 4, 5, ''];
+  let best = { filterType: 3, recordsFiltered: 0, recordsTotal: 0 };
 
-      if (score > bestScore) {
-        bestScore = score;
-        best = table;
-        bestHeaders = headers;
+  for (const ft of candidates) {
+    try {
+      const body = buildRequestBody(0, 1, ft);
+      const result = await callDataApi(page, body);
+      const filtered = result.recordsFiltered || 0;
+      const total = result.recordsTotal || 0;
+      console.log(`  filterType=${JSON.stringify(ft)} -> recordsFiltered=${filtered}, recordsTotal=${total}`);
+      if (filtered > best.recordsFiltered) {
+        best = { filterType: ft, recordsFiltered: filtered, recordsTotal: total };
       }
+    } catch (e) {
+      console.log(`  filterType=${JSON.stringify(ft)} -> request failed: ${e.message}`);
     }
-
-    if (!best) return { success: false };
-
-    // Assign a stable id/attribute so we can re-find this exact table on later pages
-    if (!best.id) best.id = 'crm_sync_target_table';
-
-    const lower = bestHeaders.map((h) => h.toLowerCase());
-    const findCol = (keywords) => lower.findIndex((h) => keywords.some((k) => h.includes(k)));
-
-    const columnMap = {
-      name: findCol(['name']),
-      phone: findCol(['phone', 'mobile']),
-      address: findCol(['address']),
-      pkg: findCol(['package', 'plan']),
-      expiry: findCol(['expiry', 'expire']),
-    };
-
-    return { success: true, tableId: best.id, headers: bestHeaders, columnMap };
-  });
+  }
+  return best;
 }
 
-// ---------- Set the page-length dropdown to the largest option available ----------
-async function selectLargestPageLength(page) {
-  return await page.evaluate(() => {
-    const selects = Array.from(document.querySelectorAll('select'));
-    let bestSelect = null;
-    let bestValue = -1;
-    for (const s of selects) {
-      const opts = Array.from(s.querySelectorAll('option'));
-      for (const opt of opts) {
-        const num = parseInt(opt.value, 10);
-        if (!isNaN(num) && num > bestValue && num <= 1000) {
-          bestValue = num;
-          bestSelect = s;
-        }
-        if (opt.value === '-1' || /all/i.test(opt.textContent)) {
-          bestSelect = s;
-          bestValue = 999999;
-          s.value = opt.value;
-          s.dispatchEvent(new Event('change', { bubbles: true }));
-          return { changed: true, value: opt.value };
-        }
-      }
-    }
-    if (bestSelect && bestValue > 0) {
-      bestSelect.value = String(bestValue);
-      bestSelect.dispatchEvent(new Event('change', { bubbles: true }));
-      return { changed: true, value: bestValue };
-    }
-    return { changed: false };
-  });
-}
-
-// ---------- Scrape all rows of the identified table using its known column map ----------
-async function scrapeTableRows(page, tableId) {
-  return await page.evaluate((id) => {
-    const table = document.getElementById(id) || document.querySelector(`table#${id}`);
-    if (!table) return [];
-    const rows = Array.from(table.querySelectorAll('tbody tr'));
-    return rows
-      .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => td.innerText.trim()))
-      .filter((r) => r.length > 0);
-  }, tableId);
-}
-
-// ---------- Click "Next" if it exists and is enabled ----------
-async function clickNextIfAvailable(page) {
-  return await page.evaluate(() => {
-    const candidates = Array.from(document.querySelectorAll('a, button, li'));
-    for (const el of candidates) {
-      const text = (el.innerText || '').trim().toLowerCase();
-      const cls = (el.className || '').toString().toLowerCase();
-      const isNext = text === 'next' || text === '>' || cls.includes('next') || cls.includes('paginate_button next');
-      if (!isNext) continue;
-      const disabled =
-        el.disabled ||
-        el.getAttribute('aria-disabled') === 'true' ||
-        cls.includes('disabled');
-      if (disabled) return { clicked: false, reachedEnd: true };
-      el.click();
-      return { clicked: true, reachedEnd: false };
-    }
-    return { clicked: false, reachedEnd: true };
-  });
-}
-
-// ---------- Read existing sheet, build phone -> row index map ----------
 async function getExistingSheetData() {
   try {
     const response = await sheets.spreadsheets.values.get({
@@ -254,7 +199,6 @@ async function getExistingSheetData() {
   }
 }
 
-// ---------- Update sheet, matching your existing column headers exactly ----------
 async function updateSheet(records) {
   const { headers, data, phoneMap } = await getExistingSheetData();
   if (headers.length === 0) {
@@ -262,6 +206,7 @@ async function updateSheet(records) {
     return;
   }
 
+  const idIdx = headers.indexOf('ID No.');
   const nameIdx = headers.indexOf('Name');
   const phoneIdx = headers.indexOf('Phone');
   const addressIdx = headers.indexOf('Address');
@@ -290,21 +235,15 @@ async function updateSheet(records) {
     if (!rec.phone) continue;
 
     const sheetRow = new Array(headers.length).fill('');
+    if (idIdx !== -1) sheetRow[idIdx] = rec.username;
     if (nameIdx !== -1) sheetRow[nameIdx] = rec.name;
     if (phoneIdx !== -1) sheetRow[phoneIdx] = rec.phone;
     if (addressIdx !== -1) sheetRow[addressIdx] = rec.address;
     if (pkgIdx !== -1) sheetRow[pkgIdx] = rec.pkg;
     if (amountPaidIdx !== -1) sheetRow[amountPaidIdx] = getPriceForPackage(rec.pkg);
+    if (activationIdx !== -1) sheetRow[activationIdx] = formatDateForSheet(rec.activationDate);
+    if (paymentDateIdx !== -1) sheetRow[paymentDateIdx] = formatDateForSheet(rec.activationDate);
     if (expiryIdx !== -1) sheetRow[expiryIdx] = formatDateForSheet(rec.expiryDate);
-
-    // Activation Date and Payment Date = Expiry - 30 days, as instructed
-    let activationDate = null;
-    if (rec.expiryDate) {
-      activationDate = new Date(rec.expiryDate);
-      activationDate.setDate(activationDate.getDate() - ACTIVATION_OFFSET_DAYS);
-    }
-    if (activationIdx !== -1) sheetRow[activationIdx] = formatDateForSheet(activationDate);
-    if (paymentDateIdx !== -1) sheetRow[paymentDateIdx] = formatDateForSheet(activationDate);
 
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
     if (statusIdx !== -1) sheetRow[statusIdx] = status;
@@ -337,7 +276,6 @@ async function updateSheet(records) {
   }
 }
 
-// ---------- Main sync ----------
 async function syncCRM() {
   console.log(`[${new Date().toISOString()}] Sync started...`);
   let browser = null;
@@ -346,78 +284,42 @@ async function syncCRM() {
     browser = await puppeteer.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      protocolTimeout: 180000,
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
+    await page.setViewport({ width: 1280, height: 800 });
 
     console.log('Logging in...');
-    await page.goto(CRM_LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    await page.goto(CRM_LOGIN_URL, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.type('input[name="username"]', CRM_USERNAME, { delay: 30 });
     await page.type('input[name="password"]', CRM_PASSWORD, { delay: 30 });
     await Promise.all([
       page.click('button[type="submit"]'),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }),
+      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
     ]);
     console.log('Login successful.');
 
     console.log('Opening customer list page...');
-    await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-    await page.waitForSelector('table', { timeout: 30000 });
-    await sleep(1500);
+    await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    console.log('Trying to select the largest page size...');
-    await selectLargestPageLength(page);
-    await sleep(2500);
+    console.log('Testing filter settings to find the one showing ALL customers...');
+    const best = await findBestFilterType(page);
+    console.log(`Best filterType found: ${JSON.stringify(best.filterType)} with ${best.recordsFiltered} of ${best.recordsTotal} total customers.`);
 
-    console.log('Identifying the correct customer table...');
-    const tableInfo = await findTableAndColumnMap(page);
-    if (!tableInfo.success) throw new Error('Could not find a table with Name/Phone/Address/Expiry columns.');
-    console.log(`Selected table headers: ${tableInfo.headers.join(' | ')}`);
-    console.log(`Column map: ${JSON.stringify(tableInfo.columnMap)}`);
+    const total = Math.max(best.recordsFiltered, best.recordsTotal, 1);
+    const fullBody = buildRequestBody(0, total, best.filterType);
+    const fullResult = await callDataApi(page, fullBody);
 
-    if (Object.values(tableInfo.columnMap).some((v) => v === -1)) {
-      console.warn('Warning: one or more expected columns (name/phone/address/expiry) were not found by header text. Results may be incomplete.');
+    const rawRows = fullResult.data || [];
+    console.log(`Fetched ${rawRows.length} customer records.`);
+
+    if (rawRows.length === 0) {
+      throw new Error('No records returned even after testing filter types.');
     }
 
-    let allRows = [];
-    let pageNum = 1;
-    const maxPages = 200;
-
-    while (pageNum <= maxPages) {
-      console.log(`Scraping page ${pageNum}...`);
-      const rows = await scrapeTableRows(page, tableInfo.tableId);
-      console.log(`  Found ${rows.length} rows on this page.`);
-      allRows = allRows.concat(rows);
-
-      const nextResult = await clickNextIfAvailable(page);
-      if (!nextResult.clicked) {
-        console.log('Reached the last page.');
-        break;
-      }
-      await sleep(1800);
-      pageNum++;
-    }
-
-    console.log(`Scraped ${allRows.length} total rows across ${pageNum} page(s).`);
-    if (allRows.length === 0) throw new Error('No rows found — check table detection.');
-
-    const { name: ni, phone: pi, address: ai, pkg: pki, expiry: ei } = tableInfo.columnMap;
-    const records = allRows
-      .map((row) => ({
-        name: ni !== -1 ? stripHtml(row[ni]) : '',
-        phone: pi !== -1 ? stripHtml(row[pi]) : '',
-        address: ai !== -1 ? stripHtml(row[ai]) : '',
-        pkg: pki !== -1 ? stripHtml(row[pki]) : '',
-        expiryDate: ei !== -1 ? parseCrmDate(row[ei]) : null,
-      }))
-      .filter((r) => r.phone);
-
-    console.log(`Mapped ${records.length} valid customer records.`);
-    if (records.length > 0) console.log('Sample record:', JSON.stringify(records[0]));
-
+    const records = rawRows.map(extractRecord);
     await updateSheet(records);
+
     console.log(`[${new Date().toISOString()}] Sync completed.`);
 
   } catch (error) {
