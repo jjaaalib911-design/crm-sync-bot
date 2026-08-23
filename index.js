@@ -1,40 +1,36 @@
 // ====================================================
-// index.js — CRM Live Data Sync (using the real data API)
-// Deploy on Railway — runs every 5 minutes, forever.
+// index.js — CRM Live Data Sync (with full pagination)
+// Deploy on Railway — runs every 5 minutes.
 // ====================================================
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
-// ---------- Environment variables (set in Railway) ----------
+// ---------- Environment variables ----------
 const {
   CRM_USERNAME,
   CRM_PASSWORD,
   CRM_LOGIN_URL,
-  CRM_LIST_PAGE_URL,   // e.g. http://223.123.38.98/user/all
-  CRM_DATA_API_URL,    // http://223.123.38.98/admin_portal/user/user/getServerSideUsers
+  CRM_LIST_PAGE_URL,
+  CRM_DATA_API_URL,
   GOOGLE_SHEET_ID,
   GOOGLE_CREDENTIALS,
 } = process.env;
 
-// ---------- Validate required variables ----------
+// ---------- Validate ----------
 const required = [
-  'CRM_USERNAME',
-  'CRM_PASSWORD',
-  'CRM_LOGIN_URL',
-  'CRM_LIST_PAGE_URL',
-  'CRM_DATA_API_URL',
-  'GOOGLE_SHEET_ID',
-  'GOOGLE_CREDENTIALS'
+  'CRM_USERNAME', 'CRM_PASSWORD', 'CRM_LOGIN_URL',
+  'CRM_LIST_PAGE_URL', 'CRM_DATA_API_URL',
+  'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'
 ];
 for (const v of required) {
   if (!process.env[v]) {
-    console.error(`❌ Missing environment variable: ${v}`);
+    console.error(`❌ Missing: ${v}`);
     process.exit(1);
   }
 }
 
-// ---------- Google Sheets Authentication ----------
+// ---------- Google Auth ----------
 let auth;
 try {
   const creds = JSON.parse(GOOGLE_CREDENTIALS);
@@ -48,30 +44,27 @@ try {
 }
 const sheets = google.sheets({ version: 'v4', auth });
 
-// ---------- Configuration ----------
-const REMINDER_WINDOW_DAYS = 3;   // customers with expiry within 3 days get "Expiring Soon"
-const UNIQUE_KEY = 'Phone';        // column used to match rows in the sheet
+// ---------- Config ----------
+const REMINDER_WINDOW_DAYS = 3;
+const UNIQUE_KEY = 'Phone';
+const PAGE_SIZE = 250; // fetch 250 per page (adjust if needed)
 
-// ---------- Helper: clean HTML tags from CRM fields ----------
+// ---------- Helpers ----------
 function stripHtml(str) {
   if (!str) return '';
   return str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Month abbreviation mapping for parsing CRM dates
 const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
 
-// Parse dates like "18 Aug 2026 12:00:00" or "2026-07-18 20:30:19"
 function parseCrmDate(text) {
   const clean = stripHtml(text);
-  // Try "DD MMM YYYY" format
   const match = clean.match(/(\d{1,2})\s+(\w{3})\w*\s+(\d{4})/);
   if (match) {
     const [, day, monAbbr, year] = match;
     const month = MONTHS[monAbbr.slice(0, 3)];
     if (month !== undefined) return new Date(parseInt(year), month, parseInt(day));
   }
-  // Fallback: "YYYY-MM-DD"
   const isoLike = clean.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (isoLike) {
     const [, y, m, d] = isoLike;
@@ -80,7 +73,6 @@ function parseCrmDate(text) {
   return null;
 }
 
-// Format Date object as YYYY-MM-DD for the sheet
 function formatDateForSheet(date) {
   if (!date) return '';
   const y = date.getFullYear();
@@ -89,7 +81,6 @@ function formatDateForSheet(date) {
   return `${y}-${m}-${d}`;
 }
 
-// Compute Status and Days Remaining based on expiry date
 function computeStatus(expiryDate, today) {
   if (!expiryDate) return { status: '', daysRemaining: '' };
   const diffDays = Math.round((expiryDate - today) / (1000 * 60 * 60 * 24));
@@ -100,19 +91,17 @@ function computeStatus(expiryDate, today) {
   return { status, daysRemaining: diffDays };
 }
 
-// ---------- Extract a clean record from one CRM data row ----------
-// The CRM returns an array of 23 fields (0‑based)
 function extractRecord(row) {
-  const name = stripHtml(row[3]);       // Full Name
-  const phone = stripHtml(row[5]);       // Phone
-  const address = stripHtml(row[6]);     // Address
-  const pkg = stripHtml(row[7]);         // Package
-  const activationDate = parseCrmDate(row[21]); // Created (used as Activation Date)
-  const expiryDate = parseCrmDate(row[14]);      // Expiry
+  const name = stripHtml(row[3]);
+  const phone = stripHtml(row[5]);
+  const address = stripHtml(row[6]);
+  const pkg = stripHtml(row[7]);
+  const activationDate = parseCrmDate(row[21]);
+  const expiryDate = parseCrmDate(row[14]);
   return { name, phone, address, pkg, activationDate, expiryDate };
 }
 
-// ---------- Read existing sheet data (to preserve "Last Notified") ----------
+// ---------- Sheet reading ----------
 async function getExistingSheetData() {
   try {
     const response = await sheets.spreadsheets.values.get({
@@ -138,15 +127,14 @@ async function getExistingSheetData() {
   }
 }
 
-// ---------- Update the Google Sheet with the fetched records ----------
+// ---------- Sheet update ----------
 async function updateSheet(records) {
   const { headers, data, phoneMap } = await getExistingSheetData();
   if (headers.length === 0) {
-    console.error('❌ Sheet headers not found. Ensure the first row has the required columns.');
+    console.error('❌ Sheet headers not found.');
     return;
   }
 
-  // Find column indices
   const nameIdx = headers.indexOf('Name');
   const phoneIdx = headers.indexOf('Phone');
   const addressIdx = headers.indexOf('Address');
@@ -170,9 +158,8 @@ async function updateSheet(records) {
   let updatedCount = 0, appendedCount = 0;
 
   for (const rec of records) {
-    if (!rec.phone) continue; // skip records without phone
+    if (!rec.phone) continue;
 
-    // Create a new row with the same length as headers
     const sheetRow = new Array(headers.length).fill('');
     if (nameIdx !== -1) sheetRow[nameIdx] = rec.name;
     if (phoneIdx !== -1) sheetRow[phoneIdx] = rec.phone;
@@ -181,15 +168,12 @@ async function updateSheet(records) {
     if (activationIdx !== -1) sheetRow[activationIdx] = formatDateForSheet(rec.activationDate);
     if (expiryIdx !== -1) sheetRow[expiryIdx] = formatDateForSheet(rec.expiryDate);
 
-    // Compute status & days
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
     if (statusIdx !== -1) sheetRow[statusIdx] = status;
     if (daysIdx !== -1) sheetRow[daysIdx] = daysRemaining;
 
-    // Check if this phone already exists
     const existingIndex = phoneMap.get(rec.phone);
     if (existingIndex !== undefined) {
-      // Preserve "Last Notified" from the existing row
       if (lastNotifiedIdx !== -1 && data[existingIndex] && data[existingIndex][lastNotifiedIdx]) {
         sheetRow[lastNotifiedIdx] = data[existingIndex][lastNotifiedIdx];
       }
@@ -201,7 +185,6 @@ async function updateSheet(records) {
     }
   }
 
-  // Write back all rows
   const allRows = updatedData.concat(newRows);
   if (allRows.length > 0) {
     await sheets.spreadsheets.values.update({
@@ -216,7 +199,7 @@ async function updateSheet(records) {
   }
 }
 
-// ---------- Build the POST payload for DataTables (matches the CRM's expected format) ----------
+// ---------- Build DataTables request body ----------
 function buildRequestBody(start, length) {
   const orderableColumns = new Set([0, 2, 3, 4, 5, 6, 7]);
   const params = new URLSearchParams();
@@ -235,12 +218,29 @@ function buildRequestBody(start, length) {
   params.append('length', String(length));
   params.append('search[value]', '');
   params.append('search[regex]', 'false');
-  params.append('filterType', '3');          // '3' = show all customers (not just active)
+  params.append('filterType', '3');
   params.append('dashboardUserTables', '1');
   return params.toString();
 }
 
-// ---------- Main sync function ----------
+// ---------- Fetch a single page ----------
+async function fetchPage(page, start, length) {
+  const body = buildRequestBody(start, length);
+  const result = await page.evaluate(async (url, body) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body,
+    });
+    return res.json();
+  }, CRM_DATA_API_URL, body);
+  return result.data || [];
+}
+
+// ---------- Main sync ----------
 async function syncCRM() {
   console.log(`[${new Date().toISOString()}] 🔄 Sync started...`);
   let browser = null;
@@ -254,7 +254,6 @@ async function syncCRM() {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // ----- LOGIN -----
     console.log('📍 Logging in...');
     await page.goto(CRM_LOGIN_URL, { waitUntil: 'networkidle2', timeout: 30000 });
     await page.type('input[name="username"]', CRM_USERNAME, { delay: 30 });
@@ -265,11 +264,10 @@ async function syncCRM() {
     ]);
     console.log('✅ Login successful.');
 
-    // ----- Navigate to the customer list page to establish session -----
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ----- Probe: get total record count (fetches just 1 record) -----
+    // --- Probe to get total count ---
     const probeBody = buildRequestBody(0, 1);
     const probeResult = await page.evaluate(async (url, body) => {
       const res = await fetch(url, {
@@ -283,32 +281,33 @@ async function syncCRM() {
       return res.json();
     }, CRM_DATA_API_URL, probeBody);
 
-    const total = probeResult.recordsTotal || 1000;
+    const total = probeResult.recordsTotal || 0;
     console.log(`📊 CRM reports ${total} total customers.`);
 
-    // ----- Fetch ALL records in one request -----
-    const fullBody = buildRequestBody(0, total);
-    const fullResult = await page.evaluate(async (url, body) => {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body,
-      });
-      return res.json();
-    }, CRM_DATA_API_URL, fullBody);
-
-    const rawRows = fullResult.data || [];
-    console.log(`📥 Fetched ${rawRows.length} customer records.`);
-
-    if (rawRows.length === 0) {
-      throw new Error('No records returned. Check CRM_DATA_API_URL and filterType.');
+    if (total === 0) {
+      throw new Error('No customers found. Check CRM_DATA_API_URL and filterType.');
     }
 
-    // ----- Convert raw rows to clean objects and update sheet -----
-    const records = rawRows.map(extractRecord);
+    // --- Paginate: fetch all pages ---
+    let allRows = [];
+    let fetched = 0;
+    while (fetched < total) {
+      const length = Math.min(PAGE_SIZE, total - fetched);
+      console.log(`📥 Fetching page from ${fetched} to ${fetched + length - 1}...`);
+      const rows = await fetchPage(page, fetched, length);
+      allRows = allRows.concat(rows);
+      fetched += length;
+      // Avoid overwhelming the server – small delay
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    console.log(`📥 Fetched ${allRows.length} customer records total.`);
+
+    if (allRows.length === 0) {
+      throw new Error('No records returned after pagination.');
+    }
+
+    const records = allRows.map(extractRecord);
     await updateSheet(records);
 
     console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
@@ -321,10 +320,8 @@ async function syncCRM() {
   }
 }
 
-// ---------- Start the bot: run once, then every 5 minutes ----------
+// ---------- Start ----------
 console.log('🚀 CRM Sync Bot starting...');
 syncCRM();
 setInterval(syncCRM, 5 * 60 * 1000);
-
-// Keep the process alive
 process.stdin.resume();
