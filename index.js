@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (PAGINATION – no dropdown) starting...');
+console.log('🚀 CRM Sync Bot (STOP CONDITION FIXED) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -195,7 +195,7 @@ async function writeFreshSheet(records) {
   console.log(`✅ Sheet overwritten with ${newRows.length} rows (${oldNotified.size} Last Notified preserved).`);
 }
 
-// ---------- Main sync with pagination ----------
+// ---------- Main sync ----------
 async function syncCRM() {
   console.log(`[${new Date().toISOString()}] 🔄 Sync started...`);
   let browser = null;
@@ -224,13 +224,44 @@ async function syncCRM() {
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
-    // ----- Scrape all pages by clicking "Next" -----
+    // ----- Set "Show entries" to 100 -----
+    console.log('🔍 Setting dropdown to 100...');
+    let pageSize = 100;
+    const selected = await page.evaluate(() => {
+      const selects = document.querySelectorAll('select');
+      for (const s of selects) {
+        const opts = s.querySelectorAll('option');
+        for (const opt of opts) {
+          if (opt.value === '100' || opt.text.includes('100') || opt.value === '50' || opt.text.includes('50')) {
+            s.value = opt.value;
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+            return opt.value;
+          }
+        }
+      }
+      return null;
+    });
+    if (selected) {
+      pageSize = parseInt(selected);
+      console.log(`✅ Selected ${pageSize}. Waiting for table update...`);
+      await sleep(2000);
+    } else {
+      console.warn('⚠️ Could not set dropdown, using default page size. Will detect.');
+      // Detect current page size from number of rows on first page
+      const rowCount = await page.evaluate(() => document.querySelectorAll('table tr').length - 1);
+      if (rowCount > 0) pageSize = rowCount;
+      console.log(`Detected page size: ${pageSize}`);
+    }
+
+    // ----- Paginate with stop condition -----
     let allRows = [];
     let pageNum = 0;
     let hasNext = true;
     let headers = [];
+    let prevRowCount = 0;
+    let maxPages = 100; // safety limit
 
-    while (hasNext) {
+    while (hasNext && pageNum < maxPages) {
       pageNum++;
       console.log(`📄 Scraping page ${pageNum}...`);
 
@@ -259,10 +290,28 @@ async function syncCRM() {
         return dataRows;
       });
 
-      console.log(`   → Found ${rows.length} rows on page ${pageNum}`);
+      const currentRowCount = rows.length;
+      console.log(`   → Found ${currentRowCount} rows on page ${pageNum}`);
       allRows = allRows.concat(rows);
 
-      // Try to click "Next" button
+      // Stop condition: if current row count is 0, or less than pageSize and we've already scraped some rows (last page)
+      if (currentRowCount === 0) {
+        console.log('✅ No rows on this page – stopping.');
+        break;
+      }
+      if (currentRowCount < pageSize && pageNum > 1) {
+        console.log(`✅ Last page detected (${currentRowCount} rows < ${pageSize}) – stopping.`);
+        break;
+      }
+
+      // Check if the row count is the same as previous page (stuck)
+      if (pageNum > 1 && currentRowCount === prevRowCount) {
+        console.warn('⚠️ Row count unchanged – may be stuck. Stopping.');
+        break;
+      }
+      prevRowCount = currentRowCount;
+
+      // Try to click "Next"
       const nextClicked = await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
@@ -278,8 +327,8 @@ async function syncCRM() {
       });
 
       if (!nextClicked) {
-        console.log('✅ No more pages.');
-        hasNext = false;
+        console.log('✅ No more pages (Next button not found or disabled).');
+        break;
       } else {
         console.log(`⏩ Clicked "Next" – loading page ${pageNum + 1}...`);
         await page.waitForSelector('table', { timeout: 30000 });
@@ -287,10 +336,14 @@ async function syncCRM() {
       }
     }
 
+    if (pageNum >= maxPages) {
+      console.warn(`⚠️ Reached max page limit (${maxPages}). Stopping to prevent infinite loop.`);
+    }
+
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Map columns (using headers) -----
+    // ----- Map columns (using headers or fallback) -----
     let idIdx, nameIdx, phoneIdx, addressIdx, pkgIdx, expiryIdx, createdIdx;
     if (headers.length > 0) {
       function findIndex(keywords) {
