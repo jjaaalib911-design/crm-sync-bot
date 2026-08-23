@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL: Correct mapping + auto price) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – with your prices) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -49,9 +49,9 @@ const REQUIRED_HEADERS = [
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
 
-// ---------- Package → Price mapping (edit this to match your rates) ----------
+// ---------- Your package prices (updated) ----------
 const PACKAGE_PRICES = {
-  '7+7Mbps': 2200,    // example – change to your actual prices
+  '7+7Mbps': 2200,
   '3+3Mbps': 1700,
   '4MB': 1500,
   '6MB': 1800,
@@ -60,8 +60,7 @@ const PACKAGE_PRICES = {
   '10MB': 2300,
   '30 MB Day': 2500,
   '50 MB': 8500,
-  // add any other packages you see
-  'default': 0       // if package not found, price = 0
+  'default': 0
 };
 
 // ---------- Helpers ----------
@@ -101,10 +100,8 @@ function computeStatus(expiryDate, today) {
   else status = 'Active';
   return { status, daysRemaining: diffDays };
 }
-// Get price for a package
 function getPriceForPackage(pkg) {
   if (!pkg) return PACKAGE_PRICES.default || 0;
-  // Try exact match, then case‑insensitive
   if (PACKAGE_PRICES[pkg] !== undefined) return PACKAGE_PRICES[pkg];
   const lower = pkg.toLowerCase();
   for (const [key, value] of Object.entries(PACKAGE_PRICES)) {
@@ -174,21 +171,18 @@ async function writeFreshSheet(records) {
   const newRows = [];
   for (const rec of records) {
     if (!rec.phone) continue;
-    // Amount paid from package
     const price = getPriceForPackage(rec.pkg);
-    // Payment date = Activation date
     const activationDateStr = formatDateForSheet(rec.activationDate);
-    const paymentDateStr = activationDateStr;  // same as activation
-    // Build row: ID No., Name, Phone, Address, Package, Amount Paid, Payment Date, Activation Date, Expiry Date, Status, Days Remaining, Last Notified
+    const paymentDateStr = activationDateStr;
     const row = [
       rec.id, rec.name, rec.phone, rec.address, rec.pkg,
       price, paymentDateStr, activationDateStr, formatDateForSheet(rec.expiryDate),
       '', '', ''
     ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    row[9] = status;      // Status
-    row[10] = daysRemaining; // Days Remaining
-    row[11] = oldNotified.get(rec.phone) || ''; // Last Notified
+    row[9] = status;
+    row[10] = daysRemaining;
+    row[11] = oldNotified.get(rec.phone) || '';
     newRows.push(row);
   }
   const allData = [REQUIRED_HEADERS, ...newRows];
@@ -256,45 +250,72 @@ async function syncCRM() {
       console.warn('⚠️ Could not set dropdown, using default page.');
     }
 
-    // ----- Scrape table -----
-    console.log('📊 Scraping table...');
-    const tableData = await page.evaluate(() => {
+    // ----- Extract header row and data rows -----
+    console.log('📊 Scraping table with headers...');
+    const { headers, rows } = await page.evaluate(() => {
       const table = document.querySelector('table');
-      if (!table) return [];
-      const rows = table.querySelectorAll('tr');
-      const data = [];
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('th, td');
-        const rowData = [];
-        cells.forEach(cell => rowData.push(cell.innerText.trim()));
-        if (rowData.length > 0) data.push(rowData);
-      });
-      return data;
+      if (!table) return { headers: [], rows: [] };
+      const allRows = table.querySelectorAll('tr');
+      if (allRows.length === 0) return { headers: [], rows: [] };
+      const headerCells = allRows[0].querySelectorAll('th, td');
+      const headers = Array.from(headerCells).map(cell => cell.innerText.trim());
+      const dataRows = [];
+      for (let i = 1; i < allRows.length; i++) {
+        const cells = allRows[i].querySelectorAll('th, td');
+        const rowData = Array.from(cells).map(cell => cell.innerText.trim());
+        if (rowData.length > 0) dataRows.push(rowData);
+      }
+      return { headers, rows: dataRows };
     });
 
-    if (tableData.length === 0) throw new Error('No table found.');
+    if (rows.length === 0) throw new Error('No data rows found.');
 
-    // Remove header row if it contains typical headers
-    let dataRows = tableData;
-    if (dataRows[0] && dataRows[0].some(cell => cell.match(/Name|Phone|Username|ID|Package/))) {
-      dataRows = dataRows.slice(1);
+    console.log(`📈 Scraped ${rows.length} data rows.`);
+    console.log(`🔍 Headers found: ${headers.join(' | ')}`);
+
+    // ----- Map column names to indices -----
+    function findIndex(keywords) {
+      for (const kw of keywords) {
+        const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
+        if (idx !== -1) return idx;
+      }
+      return -1;
     }
 
-    console.log(`📈 Scraped ${dataRows.length} rows (after removing header).`);
+    const idIdx = findIndex(['username', 'user id', 'id']);
+    const nameIdx = findIndex(['full name', 'fullname', 'name']);
+    const phoneIdx = findIndex(['phone', 'mobile', 'contact']);
+    const addressIdx = findIndex(['address', 'location']);
+    const pkgIdx = findIndex(['package', 'plan', 'bandwidth']);
+    const expiryIdx = findIndex(['expiry', 'expiration', 'expirydate', 'validuntil']);
+    const createdIdx = findIndex(['created', 'creationdate', 'createddate', 'activationdate']);
 
-    // ----- Map using correct indices -----
-    const records = dataRows.map(row => {
-      const id = stripHtml(row[3] || '');      // Username -> ID No.
-      const name = stripHtml(row[4] || '');    // Full Name
-      const phone = stripHtml(row[6] || '');   // Phone
-      const address = stripHtml(row[7] || ''); // Address
-      const pkg = stripHtml(row[8] || '');     // Package
-      const activationDate = parseCrmDate(row[22] || ''); // Created
-      const expiryDate = parseCrmDate(row[15] || '');     // Expiry
+    console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Expiry=${expiryIdx}, Created=${createdIdx}`);
+
+    // Fallback defaults (based on your CSV order)
+    const defaultIndices = { id: 3, name: 4, phone: 6, address: 7, pkg: 8, expiry: 15, created: 22 };
+    const finalId = idIdx !== -1 ? idIdx : defaultIndices.id;
+    const finalName = nameIdx !== -1 ? nameIdx : defaultIndices.name;
+    const finalPhone = phoneIdx !== -1 ? phoneIdx : defaultIndices.phone;
+    const finalAddress = addressIdx !== -1 ? addressIdx : defaultIndices.address;
+    const finalPkg = pkgIdx !== -1 ? pkgIdx : defaultIndices.pkg;
+    const finalExpiry = expiryIdx !== -1 ? expiryIdx : defaultIndices.expiry;
+    const finalCreated = createdIdx !== -1 ? createdIdx : defaultIndices.created;
+
+    // ----- Build records -----
+    const records = rows.map(row => {
+      const id = stripHtml(row[finalId] || '');
+      const name = stripHtml(row[finalName] || '');
+      const phone = stripHtml(row[finalPhone] || '');
+      const address = stripHtml(row[finalAddress] || '');
+      const pkg = stripHtml(row[finalPkg] || '');
+      const activationDate = parseCrmDate(row[finalCreated] || '');
+      const expiryDate = parseCrmDate(row[finalExpiry] || '');
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
+
     await writeFreshSheet(records);
 
     console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
