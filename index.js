@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (AUTO-EXPIRY 30 DAYS) starting...');
+console.log('🚀 CRM Sync Bot (FINAL: Expiry → Activation -30d) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -41,7 +41,6 @@ try {
 const sheets = google.sheets({ version: 'v4', auth });
 
 // ---------- Config ----------
-const EXPIRY_DAYS = 30;                // <-- change this if you want a different period
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
 const REQUIRED_HEADERS = [
@@ -63,17 +62,17 @@ const PACKAGE_PRICES = {
   'default': 0
 };
 
-// ---------- !! CORRECT COLUMN INDICES (based on your table) !! ----------
-// Table order: 0=#ID, 1=Photo, 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 7=Balance, 8=On/Off, 9=Expiry, 10=Created
+// ---------- INDICES for the FULL TABLE ----------
+// Order: 0=#ID, 1=Photo, 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 7=Balance, 8=On/Off, 9=Expiry, 10=Created
 const INDICES = {
   id: 2,       // Username → ID No.
   name: 3,     // Full Name → Name
   phone: 4,    // Phone → Phone
   address: 5,  // Address → Address
   pkg: 6,      // Package → Package
-  created: 10  // Created → Activation Date (we'll use this to compute expiry)
+  expiry: 9    // Expiry → Expiry Date (from CRM)
 };
-// -----------------------------------------------------------------------
+// --------------------------------------------------
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -184,9 +183,11 @@ async function writeFreshSheet(records) {
   for (const rec of records) {
     if (!rec.phone) continue;
     const price = getPriceForPackage(rec.pkg);
-    const activationDateStr = formatDateForSheet(rec.activationDate);
-    const paymentDateStr = activationDateStr;
-    const expiryDateStr = formatDateForSheet(rec.expiryDate); // computed expiry
+    const expiryDateStr = formatDateForSheet(rec.expiryDate);
+    const activationDate = new Date(rec.expiryDate);
+    activationDate.setDate(activationDate.getDate() - 30); // Activation = Expiry - 30 days
+    const activationDateStr = formatDateForSheet(activationDate);
+    const paymentDateStr = activationDateStr; // same as activation
     const row = [
       rec.id, rec.name, rec.phone, rec.address, rec.pkg,
       price, paymentDateStr, activationDateStr, expiryDateStr,
@@ -206,6 +207,38 @@ async function writeFreshSheet(records) {
     resource: { values: allData },
   });
   console.log(`✅ Sheet overwritten with ${newRows.length} rows (${oldNotified.size} Last Notified preserved).`);
+}
+
+// ---------- Find the best table (with Full Name, Address, Expiry) ----------
+async function findBestTable(page) {
+  return await page.evaluate(() => {
+    const tables = document.querySelectorAll('table');
+    let bestScore = -Infinity;
+    let bestTable = null;
+    let bestHeaders = [];
+
+    for (const table of tables) {
+      const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+      const headers = Array.from(ths).map(cell => cell.innerText.trim());
+      const targetCols = ['Full Name', 'Address', 'Expiry'];
+      let score = 0;
+      for (const col of targetCols) {
+        if (headers.some(h => h.toLowerCase().includes(col.toLowerCase()))) {
+          score += 1;
+        }
+      }
+      score += headers.length * 0.1;
+      const hasAction = headers.some(h => h.toLowerCase().includes('action'));
+      const hasExpiry = headers.some(h => h.toLowerCase().includes('expiry'));
+      if (hasAction && !hasExpiry) score -= 5;
+      if (score > bestScore) {
+        bestScore = score;
+        bestTable = table;
+        bestHeaders = headers;
+      }
+    }
+    return { headers: bestHeaders, success: bestTable !== null };
+  });
 }
 
 // ---------- Main sync ----------
@@ -237,7 +270,7 @@ async function syncCRM() {
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
-    // ----- Set page size to 10 (safe) -----
+    // ----- Set page size to 10 -----
     console.log('🔍 Setting page size to 10...');
     try {
       await page.evaluate(() => {
@@ -258,38 +291,15 @@ async function syncCRM() {
       console.warn('⚠️ Could not set page size:', e.message);
     }
 
-    // ----- Find the correct table (the one with "Full Name", "Address", "Created") -----
-    console.log('🔍 Searching for the main table...');
-    const tableInfo = await page.evaluate(() => {
-      const tables = document.querySelectorAll('table');
-      let bestTable = null;
-      let bestHeaders = [];
-      let bestScore = -1;
-      for (const table of tables) {
-        const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
-        const headers = Array.from(ths).map(cell => cell.innerText.trim());
-        const keys = ['Full Name', 'Address', 'Created'];
-        let score = 0;
-        for (const k of keys) {
-          if (headers.some(h => h.toLowerCase().includes(k.toLowerCase()))) score++;
-        }
-        if (score > bestScore) {
-          bestScore = score;
-          bestTable = table;
-          bestHeaders = headers;
-        }
-      }
-      if (!bestTable) return { headers: [], success: false };
-      return { headers: bestHeaders, success: true };
-    });
-
-    if (!tableInfo.success || tableInfo.headers.length === 0) {
-      throw new Error('Could not find table with Full Name, Address, Created.');
+    // ----- Find the best table -----
+    console.log('🔍 Searching for the full customer table...');
+    const { headers, success } = await findBestTable(page);
+    if (!success || headers.length === 0) {
+      throw new Error('Could not find the full customer table.');
     }
-    const headers = tableInfo.headers;
-    console.log(`✅ Found table with headers: ${headers.join(' | ')}`);
+    console.log(`✅ Selected table with headers: ${headers.join(' | ')}`);
 
-    // ----- Paginate and scrape all rows from this table -----
+    // ----- Paginate and scrape -----
     let allRows = [];
     let pageNum = 0;
     let maxPages = 100;
@@ -300,16 +310,20 @@ async function syncCRM() {
 
       const rows = await page.evaluate(() => {
         const tables = document.querySelectorAll('table');
+        let bestScore = -Infinity;
         let bestTable = null;
-        let bestScore = -1;
         for (const table of tables) {
           const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
           const headers = Array.from(ths).map(cell => cell.innerText.trim());
-          const keys = ['Full Name', 'Address', 'Created'];
+          const targetCols = ['Full Name', 'Address', 'Expiry'];
           let score = 0;
-          for (const k of keys) {
-            if (headers.some(h => h.toLowerCase().includes(k.toLowerCase()))) score++;
+          for (const col of targetCols) {
+            if (headers.some(h => h.toLowerCase().includes(col.toLowerCase()))) score += 1;
           }
+          score += headers.length * 0.1;
+          const hasAction = headers.some(h => h.toLowerCase().includes('action'));
+          const hasExpiry = headers.some(h => h.toLowerCase().includes('expiry'));
+          if (hasAction && !hasExpiry) score -= 5;
           if (score > bestScore) {
             bestScore = score;
             bestTable = table;
@@ -376,35 +390,31 @@ async function syncCRM() {
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Show raw sample row to verify indices -----
+    // ----- Show raw sample row for verification -----
     if (allRows.length > 0) {
       console.log('🔍 RAW sample row (first row):', allRows[0]);
-      console.log('🔍 Headers for reference:', headers);
-      console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Created=${INDICES.created}`);
+      console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Expiry=${INDICES.expiry}`);
     }
 
-    // ----- Build records using the INDICES and auto‑compute expiry -----
+    // ----- Build records using Expiry from CRM, compute Activation = Expiry - 30 days -----
     const records = allRows.map(row => {
       const id = stripHtml(row[INDICES.id] || '');
       const name = stripHtml(row[INDICES.name] || '');
       const phone = stripHtml(row[INDICES.phone] || '');
       const address = stripHtml(row[INDICES.address] || '');
       const pkg = stripHtml(row[INDICES.pkg] || '');
-      const activationDate = parseCrmDate(row[INDICES.created] || '');
-      
-      // Compute expiry = activation + EXPIRY_DAYS (e.g., 30 days)
-      let expiryDate = null;
-      if (activationDate) {
-        expiryDate = new Date(activationDate);
-        expiryDate.setDate(expiryDate.getDate() + EXPIRY_DAYS);
+      const expiryDate = parseCrmDate(row[INDICES.expiry] || '');
+      // Activation = Expiry - 30 days
+      let activationDate = null;
+      if (expiryDate) {
+        activationDate = new Date(expiryDate);
+        activationDate.setDate(activationDate.getDate() - 30);
       }
-      
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
 
-    // Show a sample mapped record (including address)
     if (records.length > 0) {
       console.log('🔍 MAPPED sample record:', JSON.stringify(records[0], null, 2));
     }
