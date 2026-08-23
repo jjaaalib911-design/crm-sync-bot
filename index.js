@@ -3,6 +3,9 @@ console.log('🚀 CRM Sync Bot (FINAL SCRAPER) starting...');
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
+// Helper sleep function (replaces deprecated page.waitForTimeout)
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // ---------- Environment ----------
 const {
   CRM_USERNAME,
@@ -210,7 +213,6 @@ async function syncCRM() {
       for (const sel of selectors) {
         const el = document.querySelector(sel);
         if (el && el.tagName === 'SELECT') {
-          // Try to set to 1000 or -1 (All)
           const options = el.querySelectorAll('option');
           for (const opt of options) {
             if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
@@ -243,8 +245,8 @@ async function syncCRM() {
         () => document.querySelectorAll('table tr').length > 30,
         { timeout: 15000 }
       ).catch(() => console.warn('Row count did not increase, but continuing...'));
-      // Additional wait for stability
-      await page.waitForTimeout(2000);
+      // Wait additional 2 seconds for stability
+      await sleep(2000);
     } else {
       console.warn('⚠️ Could not set "Show entries". Will try pagination next.');
     }
@@ -305,7 +307,7 @@ async function syncCRM() {
         if (!nextExists) break;
         console.log('⏩ Clicked "Next"...');
         await page.waitForSelector('table', { timeout: 15000 });
-        await page.waitForTimeout(2000);
+        await sleep(2000);
         const newData = await page.evaluate(() => {
           const table = document.querySelector('table');
           if (!table) return [];
@@ -335,7 +337,7 @@ async function syncCRM() {
       console.log(`📥 Total after pagination: ${dataRows.length} rows.`);
     }
 
-    // Map columns
+    // Map columns (indices based on your CRM's table structure)
     const records = dataRows.map(row => {
       const name = stripHtml(row[3] || '');
       const phone = stripHtml(row[5] || '');
