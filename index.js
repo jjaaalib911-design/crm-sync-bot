@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (MANUAL INDICES) starting...');
+console.log('🚀 CRM Sync Bot (AUTO-EXPIRY 30 DAYS) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -41,6 +41,7 @@ try {
 const sheets = google.sheets({ version: 'v4', auth });
 
 // ---------- Config ----------
+const EXPIRY_DAYS = 30;                // <-- change this if you want a different period
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
 const REQUIRED_HEADERS = [
@@ -62,19 +63,17 @@ const PACKAGE_PRICES = {
   'default': 0
 };
 
-// ---------- !! IMPORTANT: SET YOUR COLUMN INDICES HERE !! ----------
-// Based on your table order: 
-// 0=#ID, 1=Photo, 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 7=Balance, 8=On/Off, 9=Expiry, 10=Created
+// ---------- !! CORRECT COLUMN INDICES (based on your table) !! ----------
+// Table order: 0=#ID, 1=Photo, 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 7=Balance, 8=On/Off, 9=Expiry, 10=Created
 const INDICES = {
   id: 2,       // Username → ID No.
   name: 3,     // Full Name → Name
   phone: 4,    // Phone → Phone
   address: 5,  // Address → Address
   pkg: 6,      // Package → Package
-  expiry: 9,   // Expiry → Expiry Date
-  created: 10  // Created → Activation Date
+  created: 10  // Created → Activation Date (we'll use this to compute expiry)
 };
-// -----------------------------------------------------------------
+// -----------------------------------------------------------------------
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -187,9 +186,10 @@ async function writeFreshSheet(records) {
     const price = getPriceForPackage(rec.pkg);
     const activationDateStr = formatDateForSheet(rec.activationDate);
     const paymentDateStr = activationDateStr;
+    const expiryDateStr = formatDateForSheet(rec.expiryDate); // computed expiry
     const row = [
       rec.id, rec.name, rec.phone, rec.address, rec.pkg,
-      price, paymentDateStr, activationDateStr, formatDateForSheet(rec.expiryDate),
+      price, paymentDateStr, activationDateStr, expiryDateStr,
       '', '', ''
     ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
@@ -258,8 +258,8 @@ async function syncCRM() {
       console.warn('⚠️ Could not set page size:', e.message);
     }
 
-    // ----- Find the correct table and read headers -----
-    console.log('🔍 Searching for table with Full Name, Address, Created...');
+    // ----- Find the correct table (the one with "Full Name", "Address", "Created") -----
+    console.log('🔍 Searching for the main table...');
     const tableInfo = await page.evaluate(() => {
       const tables = document.querySelectorAll('table');
       let bestTable = null;
@@ -380,10 +380,10 @@ async function syncCRM() {
     if (allRows.length > 0) {
       console.log('🔍 RAW sample row (first row):', allRows[0]);
       console.log('🔍 Headers for reference:', headers);
-      console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Expiry=${INDICES.expiry}, Created=${INDICES.created}`);
+      console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Created=${INDICES.created}`);
     }
 
-    // ----- Build records using the INDICES -----
+    // ----- Build records using the INDICES and auto‑compute expiry -----
     const records = allRows.map(row => {
       const id = stripHtml(row[INDICES.id] || '');
       const name = stripHtml(row[INDICES.name] || '');
@@ -391,15 +391,22 @@ async function syncCRM() {
       const address = stripHtml(row[INDICES.address] || '');
       const pkg = stripHtml(row[INDICES.pkg] || '');
       const activationDate = parseCrmDate(row[INDICES.created] || '');
-      const expiryDate = parseCrmDate(row[INDICES.expiry] || '');
+      
+      // Compute expiry = activation + EXPIRY_DAYS (e.g., 30 days)
+      let expiryDate = null;
+      if (activationDate) {
+        expiryDate = new Date(activationDate);
+        expiryDate.setDate(expiryDate.getDate() + EXPIRY_DAYS);
+      }
+      
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
 
-    // Show a sample mapped record
+    // Show a sample mapped record (including address)
     if (records.length > 0) {
-      console.log('🔍 MAPPED sample record:', records[0]);
+      console.log('🔍 MAPPED sample record:', JSON.stringify(records[0], null, 2));
     }
 
     await writeFreshSheet(records);
