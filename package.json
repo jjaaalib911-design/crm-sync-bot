@@ -1,0 +1,13 @@
+{
+  "name": "crm-sync-bot",
+  "version": "1.0.0",
+  "description": "Logs into the ISP CRM using a real browser, reads live customer data directly from the CRM's data API, and syncs it into Google Sheets automatically every 5 minutes.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0",
+    "googleapis": "^131.0.0"
+  }
+}
