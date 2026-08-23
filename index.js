@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (ROBUST SCRAPER) starting...');
+console.log('🚀 CRM Sync Bot (FINAL SCRAPER) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -168,112 +168,6 @@ async function writeFreshSheet(records) {
   console.log(`✅ Sheet overwritten with ${newRows.length} rows (${oldNotified.size} Last Notified preserved).`);
 }
 
-// ---------- Scrape table with "Show entries" dropdown or pagination ----------
-async function scrapeAllRows(page) {
-  // Try to set the "Show entries" to a large number (1000)
-  const setLarge = await page.evaluate(() => {
-    // Find all select elements
-    const selects = document.querySelectorAll('select');
-    for (const s of selects) {
-      const opts = s.querySelectorAll('option');
-      for (const opt of opts) {
-        const val = opt.value;
-        if (val === '1000' || val === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
-          s.value = val;
-          s.dispatchEvent(new Event('change', { bubbles: true }));
-          return true;
-        }
-      }
-    }
-    return false;
-  });
-
-  if (setLarge) {
-    console.log('✅ Set "Show entries" to 1000/All. Waiting for table to reload...');
-    // Wait for the table to refresh (increase timeout if needed)
-    await page.waitForTimeout(3000);
-    // Optionally wait for the row count to change
-    await page.waitForFunction(
-      () => document.querySelectorAll('table tr').length > 10,
-      { timeout: 10000 }
-    ).catch(() => console.warn('Row count not updated, but continuing...'));
-  } else {
-    console.log('⚠️ Could not set "Show entries" – will use pagination next buttons.');
-  }
-
-  // Scrape all rows, handling pagination if needed
-  let allRows = [];
-  let hasNext = true;
-  let pageNum = 0;
-
-  while (hasNext) {
-    pageNum++;
-    console.log(`📄 Scraping page ${pageNum}...`);
-    // Wait for table to be present
-    await page.waitForSelector('table', { timeout: 10000 });
-
-    const pageData = await page.evaluate(() => {
-      const tables = document.querySelectorAll('table');
-      if (tables.length === 0) return [];
-      const table = tables[0];
-      const rows = table.querySelectorAll('tr');
-      const data = [];
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('th, td');
-        const rowData = [];
-        cells.forEach(cell => rowData.push(cell.innerText.trim()));
-        if (rowData.length > 0) data.push(rowData);
-      });
-      return data;
-    });
-
-    // If no rows, break
-    if (pageData.length === 0) break;
-
-    // Remove header if it's the first page (detect if first row contains typical headers)
-    let dataRows = pageData;
-    if (pageNum === 1 && dataRows.length > 0) {
-      const firstRow = dataRows[0].join(' ');
-      if (firstRow.match(/Name|Phone|Username|ID|Package|Address/)) {
-        dataRows = dataRows.slice(1);
-        console.log(`   Removed header row.`);
-      }
-    }
-
-    console.log(`   → Found ${dataRows.length} data rows on page ${pageNum}`);
-    allRows = allRows.concat(dataRows);
-
-    // Try to find and click "Next" button (if any)
-    const nextExists = await page.evaluate(() => {
-      const links = document.querySelectorAll('a, button');
-      for (const el of links) {
-        const text = (el.innerText || '').toLowerCase();
-        const cls = el.className || '';
-        if ((text.includes('next') || text.includes('>') || cls.includes('next')) && !el.disabled) {
-          // Check if it's not disabled
-          if (el.getAttribute('aria-disabled') === 'true') return false;
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-
-    if (nextExists) {
-      console.log(`⏩ Clicked "Next" – loading page ${pageNum + 1}...`);
-      await page.waitForSelector('table', { timeout: 15000 });
-      await page.waitForTimeout(2000);
-      // Check if the new page has new rows (if not, break to avoid infinite loop)
-      // We'll just loop again.
-    } else {
-      console.log('✅ No more pages (or "Next" button not found).');
-      hasNext = false;
-    }
-  }
-
-  return allRows;
-}
-
 // ---------- Main sync ----------
 async function syncCRM() {
   console.log(`[${new Date().toISOString()}] 🔄 Sync started...`);
@@ -301,17 +195,148 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // Scrape all rows (with dropdown or pagination)
-    const allRows = await scrapeAllRows(page);
+    // ----- Step 1: Find and set "Show entries" to 1000 -----
+    console.log('🔍 Searching for "Show entries" dropdown...');
+    const dropdownSet = await page.evaluate(() => {
+      // Common DataTables selectors
+      const selectors = [
+        'select[name="example_length"]',
+        'select[name="DataTables_Table_0_length"]',
+        'select[name="user_list_length"]',
+        'select[aria-controls*="DataTables"]',
+        'select:has(option[value="1000"])',
+        'select:has(option[value="-1"])'
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.tagName === 'SELECT') {
+          // Try to set to 1000 or -1 (All)
+          const options = el.querySelectorAll('option');
+          for (const opt of options) {
+            if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
+              el.value = opt.value;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            }
+          }
+        }
+      }
+      // Fallback: any select with option 1000
+      const allSelects = document.querySelectorAll('select');
+      for (const s of allSelects) {
+        const opts = s.querySelectorAll('option');
+        for (const opt of opts) {
+          if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
+            s.value = opt.value;
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+        }
+      }
+      return false;
+    });
 
-    if (allRows.length === 0) {
-      throw new Error('No customer rows scraped.');
+    if (dropdownSet) {
+      console.log('✅ Set "Show entries" to 1000/All. Waiting for table to reload...');
+      // Wait for table to update – wait for more rows than default (e.g., > 30)
+      await page.waitForFunction(
+        () => document.querySelectorAll('table tr').length > 30,
+        { timeout: 15000 }
+      ).catch(() => console.warn('Row count did not increase, but continuing...'));
+      // Additional wait for stability
+      await page.waitForTimeout(2000);
+    } else {
+      console.warn('⚠️ Could not set "Show entries". Will try pagination next.');
     }
 
-    console.log(`📥 Scraped total of ${allRows.length} customer rows.`);
+    // ----- Step 2: Scrape the table (now should have all rows) -----
+    console.log('📊 Scraping table...');
+    const tableData = await page.evaluate(() => {
+      const tables = document.querySelectorAll('table');
+      if (tables.length === 0) return [];
+      const table = tables[0];
+      const rows = table.querySelectorAll('tr');
+      const data = [];
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('th, td');
+        const rowData = [];
+        cells.forEach(cell => rowData.push(cell.innerText.trim()));
+        if (rowData.length > 0) data.push(rowData);
+      });
+      return data;
+    });
 
-    // Map columns (indices from your CSV structure)
-    const records = allRows.map(row => {
+    if (tableData.length === 0) {
+      throw new Error('No table data scraped.');
+    }
+
+    // Remove header row if present
+    let dataRows = tableData;
+    if (dataRows.length > 0 && dataRows[0].some(cell => cell.match(/Name|Phone|Username|ID|Package|Address/))) {
+      dataRows = dataRows.slice(1);
+    }
+
+    console.log(`📈 Scraped ${dataRows.length} customer rows (after removing header).`);
+
+    if (dataRows.length === 0) {
+      throw new Error('No data rows found.');
+    }
+
+    // If we got fewer rows than expected, try pagination fallback
+    if (dataRows.length < 50) {
+      console.warn('⚠️ Only scraped ' + dataRows.length + ' rows – trying pagination fallback...');
+      // Try clicking "Next" until no more pages
+      let allRows = [...dataRows];
+      let hasNext = true;
+      while (hasNext) {
+        const nextExists = await page.evaluate(() => {
+          const links = document.querySelectorAll('a, button');
+          for (const el of links) {
+            const text = (el.innerText || '').toLowerCase();
+            const cls = el.className || '';
+            if ((text.includes('next') || text.includes('>') || cls.includes('next')) && !el.disabled) {
+              if (el.getAttribute('aria-disabled') === 'true') return false;
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        });
+        if (!nextExists) break;
+        console.log('⏩ Clicked "Next"...');
+        await page.waitForSelector('table', { timeout: 15000 });
+        await page.waitForTimeout(2000);
+        const newData = await page.evaluate(() => {
+          const table = document.querySelector('table');
+          if (!table) return [];
+          const rows = table.querySelectorAll('tr');
+          const data = [];
+          rows.forEach(row => {
+            const cells = row.querySelectorAll('th, td');
+            const rowData = [];
+            cells.forEach(cell => rowData.push(cell.innerText.trim()));
+            if (rowData.length > 0) data.push(rowData);
+          });
+          return data;
+        });
+        if (newData.length > 0) {
+          // Remove header if it appears again
+          let newRows = newData;
+          if (newRows[0] && newRows[0].some(cell => cell.match(/Name|Phone|Username|ID/))) {
+            newRows = newRows.slice(1);
+          }
+          allRows = allRows.concat(newRows);
+          console.log(`   → Added ${newRows.length} rows from next page.`);
+        }
+        // Avoid infinite loop
+        if (allRows.length > 1000) break;
+      }
+      dataRows = allRows;
+      console.log(`📥 Total after pagination: ${dataRows.length} rows.`);
+    }
+
+    // Map columns
+    const records = dataRows.map(row => {
       const name = stripHtml(row[3] || '');
       const phone = stripHtml(row[5] || '');
       const address = stripHtml(row[6] || '');
