@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL – with ID No. & robust dropdown) starting...');
+console.log('🚀 CRM Sync Bot (DYNAMIC HEADER MAPPING) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -197,13 +197,11 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ----- Step 1: Find and set "Show entries" to 1000 -----
+    // ----- Select dropdown -----
     console.log('🔍 Searching for "Show entries" dropdown...');
-    // First, get the initial row count to detect change
     const initialRowCount = await page.evaluate(() => document.querySelectorAll('table tr').length);
     console.log(`Initial row count: ${initialRowCount}`);
 
-    // Try to find the select element
     const selectSelector = await page.evaluate(() => {
       const selectors = [
         'select[name="example_length"]',
@@ -215,7 +213,6 @@ async function syncCRM() {
       for (const sel of selectors) {
         const el = document.querySelector(sel);
         if (el && el.tagName === 'SELECT') {
-          // Check if it has an option with value 1000 or -1 or text "All"
           const opts = el.querySelectorAll('option');
           for (const opt of opts) {
             if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
@@ -229,15 +226,12 @@ async function syncCRM() {
 
     if (selectSelector) {
       console.log(`✅ Found select: ${selectSelector}`);
-      // Use page.select() which is more reliable
       try {
         await page.select(selectSelector, '1000', '-1');
-        console.log('✅ Selected value 1000 or -1 using page.select()');
+        console.log('✅ Selected value 1000 or -1');
       } catch (e) {
-        // If both fail, try by value
         await page.select(selectSelector, '1000');
       }
-      // Wait for the table to redraw – wait for row count to change
       await page.waitForFunction(
         (initial) => document.querySelectorAll('table tr').length > initial,
         { timeout: 15000, args: [initialRowCount] }
@@ -247,92 +241,117 @@ async function syncCRM() {
       console.warn('⚠️ Could not find select dropdown. Will use pagination fallback.');
     }
 
-    // ----- Step 2: Scrape the table -----
-    console.log('📊 Scraping table...');
-    const tableData = await page.evaluate(() => {
-      const tables = document.querySelectorAll('table');
-      if (tables.length === 0) return [];
-      const table = tables[0];
-      const rows = table.querySelectorAll('tr');
-      const data = [];
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('th, td');
-        const rowData = [];
-        cells.forEach(cell => rowData.push(cell.innerText.trim()));
-        if (rowData.length > 0) data.push(rowData);
-      });
-      return data;
+    // ----- Scrape table with headers -----
+    console.log('📊 Scraping table with headers...');
+    const { headers, rows } = await page.evaluate(() => {
+      const table = document.querySelector('table');
+      if (!table) return { headers: [], rows: [] };
+      const allRows = table.querySelectorAll('tr');
+      if (allRows.length === 0) return { headers: [], rows: [] };
+      // First row as headers
+      const headerCells = allRows[0].querySelectorAll('th, td');
+      const headers = Array.from(headerCells).map(cell => cell.innerText.trim());
+      // Data rows
+      const dataRows = [];
+      for (let i = 1; i < allRows.length; i++) {
+        const cells = allRows[i].querySelectorAll('th, td');
+        const rowData = Array.from(cells).map(cell => cell.innerText.trim());
+        if (rowData.length > 0) dataRows.push(rowData);
+      }
+      return { headers, rows: dataRows };
     });
 
-    if (tableData.length === 0) throw new Error('No table data scraped.');
+    if (rows.length === 0) throw new Error('No data rows found.');
 
-    // Remove header row if present
-    let dataRows = tableData;
-    if (dataRows.length > 0 && dataRows[0].some(cell => cell.match(/Name|Phone|Username|ID|Package|Address/))) {
-      dataRows = dataRows.slice(1);
-    }
+    console.log(`📈 Scraped ${rows.length} data rows.`);
 
-    console.log(`📈 Scraped ${dataRows.length} customer rows (after removing header).`);
+    // ----- Dynamic column mapping by header text -----
+    const headerMap = {};
+    headers.forEach((h, idx) => {
+      const key = h.toLowerCase().replace(/[^a-z0-9]/g, '');
+      headerMap[key] = idx;
+    });
 
-    // If still too few, fallback to pagination
-    if (dataRows.length < 100) {
-      console.warn('⚠️ Only scraped ' + dataRows.length + ' rows – falling back to pagination...');
-      let allRows = [...dataRows];
-      let hasNext = true;
-      while (hasNext) {
-        const nextExists = await page.evaluate(() => {
-          const links = document.querySelectorAll('a, button');
-          for (const el of links) {
-            const text = (el.innerText || '').toLowerCase();
-            const cls = el.className || '';
-            if ((text.includes('next') || text.includes('>') || cls.includes('next')) && !el.disabled) {
-              if (el.getAttribute('aria-disabled') === 'true') return false;
-              el.click();
-              return true;
-            }
-          }
-          return false;
-        });
-        if (!nextExists) break;
-        console.log('⏩ Clicked "Next"...');
-        await page.waitForSelector('table', { timeout: 15000 });
-        await sleep(2000);
-        const newData = await page.evaluate(() => {
-          const table = document.querySelector('table');
-          if (!table) return [];
-          const rows = table.querySelectorAll('tr');
-          const data = [];
-          rows.forEach(row => {
-            const cells = row.querySelectorAll('th, td');
-            const rowData = [];
-            cells.forEach(cell => rowData.push(cell.innerText.trim()));
-            if (rowData.length > 0) data.push(rowData);
-          });
-          return data;
-        });
-        if (newData.length > 0) {
-          let newRows = newData;
-          if (newRows[0] && newRows[0].some(cell => cell.match(/Name|Phone|Username|ID/))) {
-            newRows = newRows.slice(1);
-          }
-          allRows = allRows.concat(newRows);
-          console.log(`   → Added ${newRows.length} rows from next page.`);
-        }
-        if (allRows.length > 1000) break;
+    // Map our target fields to header names
+    const fieldMapping = {
+      id: ['#id', 'id', 'userid', 'customerid'],
+      name: ['fullname', 'name', 'full name', 'customer name'],
+      phone: ['phone', 'mobile', 'contact'],
+      address: ['address', 'location'],
+      pkg: ['package', 'plan', 'bandwidth'],
+      activationDate: ['created', 'creationdate', 'createddate', 'activationdate', 'activation'],
+      expiryDate: ['expiry', 'expiration', 'expirydate', 'validuntil']
+    };
+
+    function findIndex(field) {
+      const possible = fieldMapping[field];
+      for (const p of possible) {
+        const key = p.replace(/[^a-z0-9]/g, '');
+        if (headerMap[key] !== undefined) return headerMap[key];
       }
-      dataRows = allRows;
-      console.log(`📥 Total after pagination: ${dataRows.length} rows.`);
+      return -1;
     }
 
-    // ----- Map columns -----
-    const records = dataRows.map(row => {
-      const id = stripHtml(row[0] || '');
-      const name = stripHtml(row[4] || '');
-      const phone = stripHtml(row[5] || '');
-      const address = stripHtml(row[6] || '');
-      const pkg = stripHtml(row[7] || '');
-      const activationDate = parseCrmDate(row[21] || '');
-      const expiryDate = parseCrmDate(row[14] || '');
+    const idIdx = findIndex('id');
+    const nameIdx = findIndex('name');
+    const phoneIdx = findIndex('phone');
+    const addressIdx = findIndex('address');
+    const pkgIdx = findIndex('pkg');
+    const activationIdx = findIndex('activationDate');
+    const expiryIdx = findIndex('expiryDate');
+
+    console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Activation=${activationIdx}, Expiry=${expiryIdx}`);
+
+    // If any required index is missing, fallback to fixed indices from CSV structure
+    if (idIdx === -1 || nameIdx === -1 || phoneIdx === -1 || addressIdx === -1 || pkgIdx === -1 || activationIdx === -1 || expiryIdx === -1) {
+      console.warn('⚠️ Some headers not found – falling back to fixed indices (based on CSV order).');
+      // Fallback: assume order from your CSV: 0=ID, 4=FullName, 6=Phone, 7=Address, 8=Package, 22=Created, 15=Expiry
+      // But we'll use the indices that were found if any
+      const fallback = {
+        id: 0,
+        name: 4,
+        phone: 6,
+        address: 7,
+        pkg: 8,
+        activation: 22,
+        expiry: 15
+      };
+      // Override only if not found
+      const finalIdIdx = idIdx !== -1 ? idIdx : fallback.id;
+      const finalNameIdx = nameIdx !== -1 ? nameIdx : fallback.name;
+      const finalPhoneIdx = phoneIdx !== -1 ? phoneIdx : fallback.phone;
+      const finalAddressIdx = addressIdx !== -1 ? addressIdx : fallback.address;
+      const finalPkgIdx = pkgIdx !== -1 ? pkgIdx : fallback.pkg;
+      const finalActivationIdx = activationIdx !== -1 ? activationIdx : fallback.activation;
+      const finalExpiryIdx = expiryIdx !== -1 ? expiryIdx : fallback.expiry;
+
+      // Re-map
+      const records = rows.map(row => {
+        const id = stripHtml(row[finalIdIdx] || '');
+        const name = stripHtml(row[finalNameIdx] || '');
+        const phone = stripHtml(row[finalPhoneIdx] || '');
+        const address = stripHtml(row[finalAddressIdx] || '');
+        const pkg = stripHtml(row[finalPkgIdx] || '');
+        const activationDate = parseCrmDate(row[finalActivationIdx] || '');
+        const expiryDate = parseCrmDate(row[finalExpiryIdx] || '');
+        return { id, name, phone, address, pkg, activationDate, expiryDate };
+      }).filter(r => r.phone);
+
+      console.log(`✅ Using fallback mapping – ${records.length} records.`);
+      await writeFreshSheet(records);
+      console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
+      return;
+    }
+
+    // ----- Use dynamic mapping -----
+    const records = rows.map(row => {
+      const id = stripHtml(row[idIdx] || '');
+      const name = stripHtml(row[nameIdx] || '');
+      const phone = stripHtml(row[phoneIdx] || '');
+      const address = stripHtml(row[addressIdx] || '');
+      const pkg = stripHtml(row[pkgIdx] || '');
+      const activationDate = parseCrmDate(row[activationIdx] || '');
+      const expiryDate = parseCrmDate(row[expiryIdx] || '');
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
