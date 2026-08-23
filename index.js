@@ -1,7 +1,8 @@
-console.log('🚀 CRM Sync Bot (PAGINATION v2.1) starting...');
+console.log('🚀 CRM Sync Bot (AUTO-CLICK EXPORT) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
+const { parse } = require('csv-parse/sync');
 
 // ---------- Environment ----------
 const {
@@ -9,7 +10,6 @@ const {
   CRM_PASSWORD,
   CRM_LOGIN_URL,
   CRM_LIST_PAGE_URL,
-  CRM_DATA_API_URL,
   GOOGLE_SHEET_ID,
   GOOGLE_CREDENTIALS,
 } = process.env;
@@ -17,8 +17,7 @@ const {
 // ---------- Validate ----------
 const required = [
   'CRM_USERNAME', 'CRM_PASSWORD', 'CRM_LOGIN_URL',
-  'CRM_LIST_PAGE_URL', 'CRM_DATA_API_URL',
-  'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'
+  'CRM_LIST_PAGE_URL', 'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'
 ];
 for (const v of required) {
   if (!process.env[v]) {
@@ -44,14 +43,13 @@ const sheets = google.sheets({ version: 'v4', auth });
 // ---------- Config ----------
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
-const PAGE_SIZE = 100; // smaller to stay under server limits
 const REQUIRED_HEADERS = [
   'Name', 'Phone', 'Address', 'Package',
   'Amount Paid', 'Payment Date', 'Activation Date',
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
 
-// ---------- Helpers (same as before) ----------
+// ---------- Helpers ----------
 function stripHtml(str) {
   if (!str) return '';
   return str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -93,17 +91,7 @@ function computeStatus(expiryDate, today) {
   return { status, daysRemaining: diffDays };
 }
 
-function extractRecord(row) {
-  const name = stripHtml(row[3]);
-  const phone = stripHtml(row[5]);
-  const address = stripHtml(row[6]);
-  const pkg = stripHtml(row[7]);
-  const activationDate = parseCrmDate(row[21]);
-  const expiryDate = parseCrmDate(row[14]);
-  return { name, phone, address, pkg, activationDate, expiryDate };
-}
-
-// ---------- Sheet reading (gets first sheet) ----------
+// ---------- Sheet functions ----------
 async function getTargetSheetName() {
   try {
     const meta = await sheets.spreadsheets.get({
@@ -112,8 +100,7 @@ async function getTargetSheetName() {
     });
     const sheetsList = meta.data.sheets;
     if (!sheetsList || sheetsList.length === 0) {
-      // no sheets – create one
-      console.log('📝 No sheets found – creating "Sheet1"');
+      console.log('📝 No sheets – creating "Sheet1"');
       await sheets.spreadsheets.batchUpdate({
         spreadsheetId: GOOGLE_SHEET_ID,
         resource: {
@@ -128,164 +115,78 @@ async function getTargetSheetName() {
     return name;
   } catch (e) {
     console.error('❌ Failed to get sheet info:', e.message);
-    return 'Sheet1'; // fallback
+    return 'Sheet1';
   }
 }
 
-// ---------- Sheet reading with validation ----------
-async function getExistingSheetData(sheetName) {
+// Read existing Last Notified values
+async function getExistingLastNotified(sheetName) {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${sheetName}!A1:Z`,
+      range: `${sheetName}!A:Z`,
     });
     const rows = response.data.values;
-    if (!rows || rows.length === 0) {
-      console.log('ℹ️ Sheet is empty. Will create headers.');
-      return { headers: [], data: [], phoneMap: new Map() };
-    }
+    if (!rows || rows.length < 2) return new Map();
     const headers = rows[0];
-    const data = rows.slice(1);
-    
-    const missing = REQUIRED_HEADERS.filter(h => !headers.includes(h));
-    if (missing.length > 0) {
-      console.error(`❌ Missing headers: ${missing.join(', ')}`);
-      console.error(`⚠️ Your sheet has: ${headers.join(', ')}`);
-      console.error(`✅ Required: ${REQUIRED_HEADERS.join(', ')}`);
-      throw new Error('Header mismatch. Fix row 1 in your sheet.');
+    const phoneIdx = headers.indexOf(UNIQUE_KEY);
+    const lastNotifiedIdx = headers.indexOf('Last Notified');
+    if (phoneIdx === -1 || lastNotifiedIdx === -1) return new Map();
+    const map = new Map();
+    for (let i = 1; i < rows.length; i++) {
+      const phone = (rows[i][phoneIdx] || '').trim();
+      const notified = rows[i][lastNotifiedIdx] || '';
+      if (phone) map.set(phone, notified);
     }
-    
-    const phoneIndex = headers.indexOf(UNIQUE_KEY);
-    const phoneMap = new Map();
-    if (phoneIndex !== -1) {
-      data.forEach((row, idx) => {
-        const phone = (row[phoneIndex] || '').trim();
-        if (phone) phoneMap.set(phone, idx);
-      });
-    }
-    return { headers, data, phoneMap };
-  } catch (err) {
-    console.error('❌ Failed to read sheet:', err.message);
-    throw err;
+    return map;
+  } catch (e) {
+    console.error('❌ Failed to read Last Notified:', e.message);
+    return new Map();
   }
 }
 
-// ---------- Sheet update ----------
-async function updateSheet(records) {
+// Clear sheet (keep header) and write new data
+async function writeFreshSheet(records) {
   const sheetName = await getTargetSheetName();
-  const { headers, data, phoneMap } = await getExistingSheetData(sheetName);
-  
-  if (headers.length === 0) {
-    console.log('📝 Creating header row...');
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${sheetName}!A1`,
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: [REQUIRED_HEADERS] },
-    });
-    const refreshed = await getExistingSheetData(sheetName);
-    return updateSheet(records);
-  }
+  // Preserve Last Notified from old data
+  const oldNotified = await getExistingLastNotified(sheetName);
 
-  const nameIdx = headers.indexOf('Name');
-  const phoneIdx = headers.indexOf('Phone');
-  const addressIdx = headers.indexOf('Address');
-  const pkgIdx = headers.indexOf('Package');
-  const activationIdx = headers.indexOf('Activation Date');
-  const expiryIdx = headers.indexOf('Expiry Date');
-  const statusIdx = headers.indexOf('Status');
-  const daysIdx = headers.indexOf('Days Remaining');
-  const lastNotifiedIdx = headers.indexOf('Last Notified');
-
+  // Build new rows
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-
-  const updatedData = [...data];
   const newRows = [];
-  let updatedCount = 0, appendedCount = 0;
-
   for (const rec of records) {
     if (!rec.phone) continue;
-
-    const sheetRow = new Array(headers.length).fill('');
-    if (nameIdx !== -1) sheetRow[nameIdx] = rec.name;
-    if (phoneIdx !== -1) sheetRow[phoneIdx] = rec.phone;
-    if (addressIdx !== -1) sheetRow[addressIdx] = rec.address;
-    if (pkgIdx !== -1) sheetRow[pkgIdx] = rec.pkg;
-    if (activationIdx !== -1) sheetRow[activationIdx] = formatDateForSheet(rec.activationDate);
-    if (expiryIdx !== -1) sheetRow[expiryIdx] = formatDateForSheet(rec.expiryDate);
-
+    const row = [
+      rec.name,
+      rec.phone,
+      rec.address,
+      rec.pkg,
+      '', // Amount Paid – we don't have this from CRM
+      '', // Payment Date – we don't have this
+      formatDateForSheet(rec.activationDate),
+      formatDateForSheet(rec.expiryDate),
+      '',
+      '',
+      '' // Last Notified – will be restored below
+    ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    if (statusIdx !== -1) sheetRow[statusIdx] = status;
-    if (daysIdx !== -1) sheetRow[daysIdx] = daysRemaining;
-
-    const existingIndex = phoneMap.get(rec.phone);
-    if (existingIndex !== undefined) {
-      if (lastNotifiedIdx !== -1 && data[existingIndex] && data[existingIndex][lastNotifiedIdx]) {
-        sheetRow[lastNotifiedIdx] = data[existingIndex][lastNotifiedIdx];
-      }
-      updatedData[existingIndex] = sheetRow;
-      updatedCount++;
-    } else {
-      newRows.push(sheetRow);
-      appendedCount++;
-    }
+    row[8] = status;   // Status
+    row[9] = daysRemaining; // Days Remaining
+    // Restore Last Notified if we have it
+    row[10] = oldNotified.get(rec.phone) || '';
+    newRows.push(row);
   }
 
-  const allRows = updatedData.concat(newRows);
-  if (allRows.length > 0) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `${sheetName}!A2:Z${allRows.length + 1}`,
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: allRows },
-    });
-    console.log(`✅ Sheet updated: ${updatedCount} updated, ${appendedCount} appended.`);
-  } else {
-    console.log('ℹ️ No changes to sheet.');
-  }
-}
-
-// ---------- Build DataTables request (with draw increment) ----------
-let drawCounter = 1;
-function buildRequestBody(start, length) {
-  const orderableColumns = new Set([0, 2, 3, 4, 5, 6, 7]);
-  const params = new URLSearchParams();
-  params.append('draw', String(drawCounter++));
-  for (let i = 0; i <= 22; i++) {
-    params.append(`columns[${i}][data]`, String(i));
-    params.append(`columns[${i}][name]`, '');
-    params.append(`columns[${i}][searchable]`, 'true');
-    params.append(`columns[${i}][orderable]`, orderableColumns.has(i) ? 'true' : 'false');
-    params.append(`columns[${i}][search][value]`, '');
-    params.append(`columns[${i}][search][regex]`, 'false');
-  }
-  params.append('order[0][column]', '0');
-  params.append('order[0][dir]', 'desc');
-  params.append('start', String(start));
-  params.append('length', String(length));
-  params.append('search[value]', '');
-  params.append('search[regex]', 'false');
-  params.append('filterType', '3');
-  params.append('dashboardUserTables', '1');
-  return params.toString();
-}
-
-// ---------- Fetch a single page ----------
-async function fetchPage(page, start, length) {
-  const body = buildRequestBody(start, length);
-  const result = await page.evaluate(async (url, body) => {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      body,
-    });
-    return res.json();
-  }, CRM_DATA_API_URL, body);
-  return result.data || [];
+  // Write header + data
+  const allData = [REQUIRED_HEADERS, ...newRows];
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetName}!A1`,
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: allData },
+  });
+  console.log(`✅ Sheet overwritten with ${newRows.length} rows (${oldNotified.size} Last Notified preserved).`);
 }
 
 // ---------- Main sync ----------
@@ -315,51 +216,96 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // --- Probe for total ---
-    const probeBody = buildRequestBody(0, 1);
-    const probeResult = await page.evaluate(async (url, body) => {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body,
+    // ----- Find and click Export button -----
+    console.log('🔍 Searching for Export button...');
+    // Wait for the page to load
+    await page.waitForSelector('body', { timeout: 10000 });
+
+    // Try to find a button/link that triggers export
+    const exportClicked = await page.evaluate(() => {
+      // Look for links with export/csv/download
+      const links = document.querySelectorAll('a, button, input[type="button"], input[type="submit"]');
+      for (const el of links) {
+        const text = (el.innerText || '').toLowerCase();
+        const href = el.href || '';
+        const onclick = el.getAttribute('onclick') || '';
+        const className = el.className || '';
+        const id = el.id || '';
+        if (text.includes('export') || text.includes('csv') || text.includes('download') ||
+            href.includes('export') || href.includes('csv') || href.includes('download') ||
+            onclick.includes('export') || onclick.includes('csv') ||
+            className.includes('export') || id.includes('export')) {
+          // Click it
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (!exportClicked) {
+      throw new Error('Could not find Export button. Try manual URL or check page structure.');
+    }
+
+    console.log('✅ Export button clicked. Waiting for download...');
+
+    // Intercept the CSV response
+    let csvContent = '';
+    const responsePromise = new Promise((resolve) => {
+      page.on('response', async (response) => {
+        const url = response.url();
+        const contentType = response.headers()['content-type'] || '';
+        if (url.includes('export') || url.includes('csv') || url.includes('download') ||
+            contentType.includes('csv') || contentType.includes('text/plain') || contentType.includes('application/octet-stream')) {
+          try {
+            const buffer = await response.buffer();
+            csvContent = buffer.toString('utf8');
+            resolve();
+          } catch (e) {
+            // ignore
+          }
+        }
       });
-      return res.json();
-    }, CRM_DATA_API_URL, probeBody);
+      // Fallback: if no response after 20s, resolve anyway
+      setTimeout(resolve, 20000);
+    });
 
-    const total = probeResult.recordsTotal || 0;
-    console.log(`📊 CRM reports ${total} total customers.`);
+    await responsePromise;
 
-    if (total === 0) {
-      throw new Error('No customers found.');
+    // If we didn't get CSV, try to get it from page content (some CRM serve CSV directly)
+    if (!csvContent || csvContent.length < 100) {
+      console.warn('⚠️ No CSV captured via network. Trying page content...');
+      csvContent = await page.evaluate(() => document.body.innerText);
     }
 
-    // --- Paginate with smaller PAGE_SIZE and draw increment ---
-    let allRows = [];
-    let fetched = 0;
-    let pageNum = 0;
-    while (fetched < total) {
-      const length = Math.min(PAGE_SIZE, total - fetched);
-      console.log(`📥 Fetching page ${pageNum + 1}: rows ${fetched} to ${fetched + length - 1}...`);
-      const rows = await fetchPage(page, fetched, length);
-      console.log(`   → received ${rows.length} rows`);
-      allRows = allRows.concat(rows);
-      fetched += length;
-      pageNum++;
-      // small delay to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 300));
+    if (!csvContent || csvContent.length < 50) {
+      throw new Error('Failed to get CSV content.');
     }
 
-    console.log(`📥 Fetched ${allRows.length} customer records total.`);
+    console.log(`📄 CSV size: ${csvContent.length} characters.`);
 
-    if (allRows.length === 0) {
-      throw new Error('No records returned.');
-    }
+    // ----- Parse CSV -----
+    const records = parse(csvContent, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+    });
+    console.log(`📈 Found ${records.length} customer records.`);
 
-    const records = allRows.map(extractRecord);
-    await updateSheet(records);
+    // Map CSV fields to our record structure
+    const mapped = records.map(row => {
+      // Try to find fields by common names
+      const name = row['Full Name'] || row['Name'] || '';
+      const phone = row['Phone'] || '';
+      const address = row['Address'] || '';
+      const pkg = row['Package'] || '';
+      const activationDate = parseCrmDate(row['Created'] || row['Activation Date'] || '');
+      const expiryDate = parseCrmDate(row['Expiry'] || row['Expiry Date'] || '');
+      return { name, phone, address, pkg, activationDate, expiryDate };
+    });
+
+    // ----- Overwrite sheet with all customers -----
+    await writeFreshSheet(mapped);
 
     console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
 
