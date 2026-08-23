@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL – with your prices) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – with your prices + extended timeouts) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -49,7 +49,7 @@ const REQUIRED_HEADERS = [
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
 
-// ---------- Your package prices (updated) ----------
+// ---------- Your package prices ----------
 const PACKAGE_PRICES = {
   '7+7Mbps': 2200,
   '3+3Mbps': 1700,
@@ -210,17 +210,20 @@ async function syncCRM() {
     await page.setViewport({ width: 1280, height: 800 });
 
     console.log('📍 Logging in...');
-    await page.goto(CRM_LOGIN_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    // Increased timeout to 60s and use domcontentloaded
+    await page.goto(CRM_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.type('input[name="username"]', CRM_USERNAME, { delay: 30 });
     await page.type('input[name="password"]', CRM_PASSWORD, { delay: 30 });
     await Promise.all([
       page.click('button[type="submit"]'),
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
     ]);
     console.log('✅ Login successful.');
 
     console.log('📍 Opening customer list page...');
-    await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Wait for table to be present
+    await page.waitForSelector('table', { timeout: 60000 });
 
     // ----- Set "Show entries" to 1000 -----
     console.log('🔍 Setting dropdown to 1000...');
