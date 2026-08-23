@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL – correct table) starting...');
+console.log('🚀 CRM Sync Bot (HARDCODED INDICES) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -223,90 +223,15 @@ async function syncCRM() {
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
-    // ----- Choose the correct table (with Full Name, Address, Created) -----
-    console.log('🔍 Searching for the correct table...');
-    const tableInfo = await page.evaluate(() => {
-      const tables = document.querySelectorAll('table');
-      let bestTable = null;
-      let bestScore = -1;
-      let bestHeaders = [];
-      for (const table of tables) {
-        const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
-        const headers = Array.from(ths).map(cell => cell.innerText.trim());
-        // Score: count of how many of our target columns are present
-        const target = ['Full Name', 'Address', 'Created'];
-        let score = 0;
-        for (const t of target) {
-          if (headers.some(h => h.includes(t))) score++;
-        }
-        // Also prefer tables with more columns
-        score += headers.length * 0.1; // slight bias for larger tables
-        if (score > bestScore) {
-          bestScore = score;
-          bestTable = table;
-          bestHeaders = headers;
-        }
-      }
-      if (!bestTable) return { headers: [], index: -1 };
-      // Find index of this table among all tables
-      const allTables = document.querySelectorAll('table');
-      let idx = 0;
-      for (const t of allTables) {
-        if (t === bestTable) break;
-        idx++;
-      }
-      return { headers: bestHeaders, index: idx };
-    });
-
-    if (tableInfo.index === -1 || tableInfo.headers.length === 0) {
-      throw new Error('Could not find the correct table with Full Name, Address, Created.');
-    }
-    const headers = tableInfo.headers;
-    console.log(`✅ Selected table with headers: ${headers.join(' | ')}`);
-    console.log(`Table index: ${tableInfo.index}`);
-
-    // We'll need to select the table each time we navigate; we can use the index to find it.
-    // But after clicking Next, the table structure remains; we can still use the index.
-    // However, it's safer to re-identify the table by headers each time.
-    // We'll implement a helper to get the table rows from the correct table.
-    const getTableData = async () => {
-      return await page.evaluate((targetHeaders) => {
-        const tables = document.querySelectorAll('table');
-        let bestTable = null;
-        let bestScore = -1;
-        for (const table of tables) {
-          const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
-          const headers = Array.from(ths).map(cell => cell.innerText.trim());
-          let score = 0;
-          for (const h of targetHeaders) {
-            if (headers.some(th => th.includes(h))) score++;
-          }
-          if (score > bestScore) {
-            bestScore = score;
-            bestTable = table;
-          }
-        }
-        if (!bestTable) return [];
-        const rows = bestTable.querySelectorAll('tr');
-        const data = [];
-        for (let i = 1; i < rows.length; i++) {
-          const cells = rows[i].querySelectorAll('th, td');
-          const rowData = Array.from(cells).map(cell => cell.innerText.trim());
-          if (rowData.length > 0) data.push(rowData);
-        }
-        return data;
-      }, ['Full Name', 'Address', 'Created']);
-    };
-
-    // ----- Set page size -----
-    console.log('🔍 Setting page size to 50...');
+    // ----- Set page size to 10 (or whatever works) -----
+    console.log('🔍 Setting page size to 10...');
     try {
       await page.evaluate(() => {
         const selects = document.querySelectorAll('select');
         for (const s of selects) {
           const opts = s.querySelectorAll('option');
           for (const opt of opts) {
-            if (opt.value === '50' || opt.value === '100' || opt.value === '10') {
+            if (opt.value === '10' || opt.value === '25' || opt.value === '50') {
               s.value = opt.value;
               s.dispatchEvent(new Event('change', { bubbles: true }));
               return;
@@ -319,7 +244,7 @@ async function syncCRM() {
       console.warn('⚠️ Could not set page size:', e.message);
     }
 
-    // ----- Paginate -----
+    // ----- Paginate and scrape all rows -----
     let allRows = [];
     let pageNum = 0;
     let maxPages = 100;
@@ -328,12 +253,24 @@ async function syncCRM() {
       pageNum++;
       console.log(`📄 Scraping page ${pageNum}...`);
 
-      // Get data from the correct table
-      const rows = await getTableData();
+      // Extract data rows from the table (any table, but we assume there's only one main table)
+      const rows = await page.evaluate(() => {
+        const table = document.querySelector('table');
+        if (!table) return [];
+        const trs = table.querySelectorAll('tr');
+        const dataRows = [];
+        for (let i = 1; i < trs.length; i++) {
+          const tds = trs[i].querySelectorAll('th, td');
+          const rowData = Array.from(tds).map(cell => cell.innerText.trim());
+          if (rowData.length > 0) dataRows.push(rowData);
+        }
+        return dataRows;
+      });
+
       console.log(`   → Found ${rows.length} rows on page ${pageNum}`);
       allRows = allRows.concat(rows);
 
-      // Check if Next button exists and is not disabled
+      // Check Next button
       const nextInfo = await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
@@ -356,7 +293,6 @@ async function syncCRM() {
         break;
       }
 
-      // Click Next
       await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
@@ -381,43 +317,26 @@ async function syncCRM() {
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Map columns using headers -----
-    function findIndex(keywords) {
-      for (const kw of keywords) {
-        const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
-        if (idx !== -1) return idx;
-      }
-      return -1;
-    }
+    // ----- Map columns using HARDCODED indices (based on your table order) -----
+    // Table order: #ID(0), Photo(1), Username(2), Full Name(3), Phone(4), Address(5), Package(6), Balance(7), On/Off(8), Expiry(9), Created(10), Action(11)
+    const idxId = 2;       // Username
+    const idxName = 3;     // Full Name
+    const idxPhone = 4;    // Phone
+    const idxAddress = 5;  // Address
+    const idxPkg = 6;      // Package
+    const idxExpiry = 9;   // Expiry
+    const idxCreated = 10; // Created
 
-    const idIdx = findIndex(['username', 'user id', 'id']);
-    const nameIdx = findIndex(['full name', 'fullname', 'name']);
-    const phoneIdx = findIndex(['phone', 'mobile', 'contact']);
-    const addressIdx = findIndex(['address', 'location']);
-    const pkgIdx = findIndex(['package', 'plan', 'bandwidth']);
-    const expiryIdx = findIndex(['expiry', 'expiration', 'expirydate', 'validuntil']);
-    const createdIdx = findIndex(['created', 'creationdate', 'createddate', 'activationdate']);
-
-    console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Expiry=${expiryIdx}, Created=${createdIdx}`);
-
-    // Fallback defaults (if any index is -1)
-    const defaultIndices = { id: 3, name: 4, phone: 6, address: 7, pkg: 8, expiry: 15, created: 22 };
-    const finalId = idIdx !== -1 ? idIdx : defaultIndices.id;
-    const finalName = nameIdx !== -1 ? nameIdx : defaultIndices.name;
-    const finalPhone = phoneIdx !== -1 ? phoneIdx : defaultIndices.phone;
-    const finalAddress = addressIdx !== -1 ? addressIdx : defaultIndices.address;
-    const finalPkg = pkgIdx !== -1 ? pkgIdx : defaultIndices.pkg;
-    const finalExpiry = expiryIdx !== -1 ? expiryIdx : defaultIndices.expiry;
-    const finalCreated = createdIdx !== -1 ? createdIdx : defaultIndices.created;
+    console.log(`Using hardcoded indices: ID=${idxId}, Name=${idxName}, Phone=${idxPhone}, Address=${idxAddress}, Package=${idxPkg}, Expiry=${idxExpiry}, Created=${idxCreated}`);
 
     const records = allRows.map(row => {
-      const id = stripHtml(row[finalId] || '');
-      const name = stripHtml(row[finalName] || '');
-      const phone = stripHtml(row[finalPhone] || '');
-      const address = stripHtml(row[finalAddress] || '');
-      const pkg = stripHtml(row[finalPkg] || '');
-      const activationDate = parseCrmDate(row[finalCreated] || '');
-      const expiryDate = parseCrmDate(row[finalExpiry] || '');
+      const id = stripHtml(row[idxId] || '');
+      const name = stripHtml(row[idxName] || '');
+      const phone = stripHtml(row[idxPhone] || '');
+      const address = stripHtml(row[idxAddress] || '');
+      const pkg = stripHtml(row[idxPkg] || '');
+      const activationDate = parseCrmDate(row[idxCreated] || '');
+      const expiryDate = parseCrmDate(row[idxExpiry] || '');
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
