@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL – corrected indices) starting...');
+console.log('🚀 CRM Sync Bot (MANUAL INDICES) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -61,6 +61,20 @@ const PACKAGE_PRICES = {
   '50 MB': 8500,
   'default': 0
 };
+
+// ---------- !! IMPORTANT: SET YOUR COLUMN INDICES HERE !! ----------
+// Based on your table order: 
+// 0=#ID, 1=Photo, 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 7=Balance, 8=On/Off, 9=Expiry, 10=Created
+const INDICES = {
+  id: 2,       // Username → ID No.
+  name: 3,     // Full Name → Name
+  phone: 4,    // Phone → Phone
+  address: 5,  // Address → Address
+  pkg: 6,      // Package → Package
+  expiry: 9,   // Expiry → Expiry Date
+  created: 10  // Created → Activation Date
+};
+// -----------------------------------------------------------------
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -244,8 +258,8 @@ async function syncCRM() {
       console.warn('⚠️ Could not set page size:', e.message);
     }
 
-    // ----- Find correct table and extract headers -----
-    console.log('🔍 Searching for the correct table...');
+    // ----- Find the correct table and read headers -----
+    console.log('🔍 Searching for table with Full Name, Address, Created...');
     const tableInfo = await page.evaluate(() => {
       const tables = document.querySelectorAll('table');
       let bestTable = null;
@@ -275,38 +289,7 @@ async function syncCRM() {
     const headers = tableInfo.headers;
     console.log(`✅ Found table with headers: ${headers.join(' | ')}`);
 
-    // ----- Map columns by header name (with fallback) -----
-    function findIndex(keywords) {
-      for (const kw of keywords) {
-        const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
-        if (idx !== -1) return idx;
-      }
-      return -1;
-    }
-
-    // Try to find indices dynamically
-    let idIdx = findIndex(['username', 'user id']);
-    let nameIdx = findIndex(['full name', 'fullname']);
-    let phoneIdx = findIndex(['phone', 'mobile']);
-    let addressIdx = findIndex(['address', 'location']);
-    let pkgIdx = findIndex(['package', 'plan']);
-    let expiryIdx = findIndex(['expiry', 'expiration']);
-    let createdIdx = findIndex(['created', 'creation']);
-
-    // If any not found, use hardcoded fallback (based on observed order: #ID, Photo, Username, Full Name, Phone, Address, Package, Balance, On/Off, Expiry, Created)
-    // So indices: 2=Username, 3=Full Name, 4=Phone, 5=Address, 6=Package, 9=Expiry, 10=Created
-    const fallback = { id: 2, name: 3, phone: 4, address: 5, pkg: 6, expiry: 9, created: 10 };
-    const finalId = idIdx !== -1 ? idIdx : fallback.id;
-    const finalName = nameIdx !== -1 ? nameIdx : fallback.name;
-    const finalPhone = phoneIdx !== -1 ? phoneIdx : fallback.phone;
-    const finalAddress = addressIdx !== -1 ? addressIdx : fallback.address;
-    const finalPkg = pkgIdx !== -1 ? pkgIdx : fallback.pkg;
-    const finalExpiry = expiryIdx !== -1 ? expiryIdx : fallback.expiry;
-    const finalCreated = createdIdx !== -1 ? createdIdx : fallback.created;
-
-    console.log(`Mapped indices: ID=${finalId}, Name=${finalName}, Phone=${finalPhone}, Address=${finalAddress}, Package=${finalPkg}, Expiry=${finalExpiry}, Created=${finalCreated}`);
-
-    // ----- Paginate and scrape -----
+    // ----- Paginate and scrape all rows from this table -----
     let allRows = [];
     let pageNum = 0;
     let maxPages = 100;
@@ -346,6 +329,7 @@ async function syncCRM() {
       console.log(`   → Found ${rows.length} rows on page ${pageNum}`);
       allRows = allRows.concat(rows);
 
+      // Check Next button
       const nextInfo = await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
@@ -392,25 +376,30 @@ async function syncCRM() {
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Log sample for debugging -----
+    // ----- Show raw sample row to verify indices -----
     if (allRows.length > 0) {
-      console.log('🔍 Sample raw row:', allRows[0]);
+      console.log('🔍 RAW sample row (first row):', allRows[0]);
+      console.log('🔍 Headers for reference:', headers);
+      console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Expiry=${INDICES.expiry}, Created=${INDICES.created}`);
     }
 
+    // ----- Build records using the INDICES -----
     const records = allRows.map(row => {
-      const id = stripHtml(row[finalId] || '');
-      const name = stripHtml(row[finalName] || '');
-      const phone = stripHtml(row[finalPhone] || '');
-      const address = stripHtml(row[finalAddress] || '');
-      const pkg = stripHtml(row[finalPkg] || '');
-      const activationDate = parseCrmDate(row[finalCreated] || '');
-      const expiryDate = parseCrmDate(row[finalExpiry] || '');
+      const id = stripHtml(row[INDICES.id] || '');
+      const name = stripHtml(row[INDICES.name] || '');
+      const phone = stripHtml(row[INDICES.phone] || '');
+      const address = stripHtml(row[INDICES.address] || '');
+      const pkg = stripHtml(row[INDICES.pkg] || '');
+      const activationDate = parseCrmDate(row[INDICES.created] || '');
+      const expiryDate = parseCrmDate(row[INDICES.expiry] || '');
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
+
+    // Show a sample mapped record
     if (records.length > 0) {
-      console.log('🔍 Sample mapped record:', records[0]);
+      console.log('🔍 MAPPED sample record:', records[0]);
     }
 
     await writeFreshSheet(records);
