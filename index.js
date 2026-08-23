@@ -1,12 +1,9 @@
-// ====================================================
-// index.js — CRM Live Data Sync (with full pagination)
-// Deploy on Railway — runs every 5 minutes, forever.
-// ====================================================
+console.log('🚀 CRM Sync Bot (PAGINATION v2.1) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
-// ---------- Environment variables ----------
+// ---------- Environment ----------
 const {
   CRM_USERNAME,
   CRM_PASSWORD,
@@ -47,16 +44,14 @@ const sheets = google.sheets({ version: 'v4', auth });
 // ---------- Config ----------
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
-const PAGE_SIZE = 250;
-
-// Required headers (exactly as they must appear in row 1)
+const PAGE_SIZE = 100; // smaller to stay under server limits
 const REQUIRED_HEADERS = [
   'Name', 'Phone', 'Address', 'Package',
   'Amount Paid', 'Payment Date', 'Activation Date',
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
 
-// ---------- Helpers ----------
+// ---------- Helpers (same as before) ----------
 function stripHtml(str) {
   if (!str) return '';
   return str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -108,16 +103,45 @@ function extractRecord(row) {
   return { name, phone, address, pkg, activationDate, expiryDate };
 }
 
+// ---------- Sheet reading (gets first sheet) ----------
+async function getTargetSheetName() {
+  try {
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      fields: 'sheets.properties',
+    });
+    const sheetsList = meta.data.sheets;
+    if (!sheetsList || sheetsList.length === 0) {
+      // no sheets – create one
+      console.log('📝 No sheets found – creating "Sheet1"');
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: GOOGLE_SHEET_ID,
+        resource: {
+          requests: [{ addSheet: { properties: { title: 'Sheet1' } } }]
+        }
+      });
+      return 'Sheet1';
+    }
+    const firstSheet = sheetsList[0];
+    const name = firstSheet.properties.title;
+    console.log(`📌 Writing to sheet: "${name}"`);
+    return name;
+  } catch (e) {
+    console.error('❌ Failed to get sheet info:', e.message);
+    return 'Sheet1'; // fallback
+  }
+}
+
 // ---------- Sheet reading with validation ----------
-async function getExistingSheetData() {
+async function getExistingSheetData(sheetName) {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'A1:Z',
+      range: `${sheetName}!A1:Z`,
     });
     const rows = response.data.values;
     if (!rows || rows.length === 0) {
-      console.log('ℹ️ Sheet is completely empty. Will create headers.');
+      console.log('ℹ️ Sheet is empty. Will create headers.');
       return { headers: [], data: [], phoneMap: new Map() };
     }
     const headers = rows[0];
@@ -148,17 +172,18 @@ async function getExistingSheetData() {
 
 // ---------- Sheet update ----------
 async function updateSheet(records) {
-  const { headers, data, phoneMap } = await getExistingSheetData();
+  const sheetName = await getTargetSheetName();
+  const { headers, data, phoneMap } = await getExistingSheetData(sheetName);
   
   if (headers.length === 0) {
     console.log('📝 Creating header row...');
     await sheets.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'A1',
+      range: `${sheetName}!A1`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: [REQUIRED_HEADERS] },
     });
-    const refreshed = await getExistingSheetData();
+    const refreshed = await getExistingSheetData(sheetName);
     return updateSheet(records);
   }
 
@@ -211,7 +236,7 @@ async function updateSheet(records) {
   if (allRows.length > 0) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: GOOGLE_SHEET_ID,
-      range: `A2:Z${allRows.length + 1}`,
+      range: `${sheetName}!A2:Z${allRows.length + 1}`,
       valueInputOption: 'USER_ENTERED',
       resource: { values: allRows },
     });
@@ -221,11 +246,12 @@ async function updateSheet(records) {
   }
 }
 
-// ---------- Build DataTables request body ----------
+// ---------- Build DataTables request (with draw increment) ----------
+let drawCounter = 1;
 function buildRequestBody(start, length) {
   const orderableColumns = new Set([0, 2, 3, 4, 5, 6, 7]);
   const params = new URLSearchParams();
-  params.append('draw', '1');
+  params.append('draw', String(drawCounter++));
   for (let i = 0; i <= 22; i++) {
     params.append(`columns[${i}][data]`, String(i));
     params.append(`columns[${i}][name]`, '');
@@ -289,7 +315,7 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // --- Probe to get total count ---
+    // --- Probe for total ---
     const probeBody = buildRequestBody(0, 1);
     const probeResult = await page.evaluate(async (url, body) => {
       const res = await fetch(url, {
@@ -310,16 +336,20 @@ async function syncCRM() {
       throw new Error('No customers found.');
     }
 
-    // --- Paginate: fetch all pages ---
+    // --- Paginate with smaller PAGE_SIZE and draw increment ---
     let allRows = [];
     let fetched = 0;
+    let pageNum = 0;
     while (fetched < total) {
       const length = Math.min(PAGE_SIZE, total - fetched);
-      console.log(`📥 Fetching page from ${fetched} to ${fetched + length - 1}...`);
+      console.log(`📥 Fetching page ${pageNum + 1}: rows ${fetched} to ${fetched + length - 1}...`);
       const rows = await fetchPage(page, fetched, length);
+      console.log(`   → received ${rows.length} rows`);
       allRows = allRows.concat(rows);
       fetched += length;
-      await new Promise(resolve => setTimeout(resolve, 200));
+      pageNum++;
+      // small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 300));
     }
 
     console.log(`📥 Fetched ${allRows.length} customer records total.`);
@@ -342,7 +372,6 @@ async function syncCRM() {
 }
 
 // ---------- Start ----------
-console.log('🚀 CRM Sync Bot starting...');
 syncCRM();
 setInterval(syncCRM, 5 * 60 * 1000);
 process.stdin.resume();
