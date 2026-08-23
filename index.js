@@ -1,6 +1,6 @@
 // ====================================================
-// index.js — CRM Live Data Sync (with full pagination)
-// Deploy on Railway — runs every 5 minutes.
+// index.js — CRM Live Data Sync (with header validation)
+// Deploy on Railway — runs every 5 minutes, forever.
 // ====================================================
 
 const puppeteer = require('puppeteer');
@@ -47,7 +47,14 @@ const sheets = google.sheets({ version: 'v4', auth });
 // ---------- Config ----------
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
-const PAGE_SIZE = 250; // fetch 250 per page (adjust if needed)
+const PAGE_SIZE = 250;
+
+// Required headers (exactly as they must appear in row 1)
+const REQUIRED_HEADERS = [
+  'Name', 'Phone', 'Address', 'Package',
+  'Amount Paid', 'Payment Date', 'Activation Date',
+  'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
+];
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -101,7 +108,7 @@ function extractRecord(row) {
   return { name, phone, address, pkg, activationDate, expiryDate };
 }
 
-// ---------- Sheet reading ----------
+// ---------- Sheet reading with validation ----------
 async function getExistingSheetData() {
   try {
     const response = await sheets.spreadsheets.values.get({
@@ -109,9 +116,22 @@ async function getExistingSheetData() {
       range: 'A1:Z',
     });
     const rows = response.data.values;
-    if (!rows || rows.length === 0) return { headers: [], data: [], phoneMap: new Map() };
+    if (!rows || rows.length === 0) {
+      console.log('ℹ️ Sheet is completely empty. Will create headers.');
+      return { headers: [], data: [], phoneMap: new Map() };
+    }
     const headers = rows[0];
     const data = rows.slice(1);
+    
+    // Validate that all required headers exist
+    const missing = REQUIRED_HEADERS.filter(h => !headers.includes(h));
+    if (missing.length > 0) {
+      console.error(`❌ Missing headers: ${missing.join(', ')}`);
+      console.error(`⚠️ Your sheet has: ${headers.join(', ')}`);
+      console.error(`✅ Required: ${REQUIRED_HEADERS.join(', ')}`);
+      throw new Error('Header mismatch. Fix row 1 in your sheet.');
+    }
+    
     const phoneIndex = headers.indexOf(UNIQUE_KEY);
     const phoneMap = new Map();
     if (phoneIndex !== -1) {
@@ -123,16 +143,26 @@ async function getExistingSheetData() {
     return { headers, data, phoneMap };
   } catch (err) {
     console.error('❌ Failed to read sheet:', err.message);
-    return { headers: [], data: [], phoneMap: new Map() };
+    throw err;
   }
 }
 
 // ---------- Sheet update ----------
 async function updateSheet(records) {
   const { headers, data, phoneMap } = await getExistingSheetData();
+  
+  // If sheet was empty, create headers
   if (headers.length === 0) {
-    console.error('❌ Sheet headers not found.');
-    return;
+    console.log('📝 Creating header row...');
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: 'A1',
+      valueInputOption: 'USER_ENTERED',
+      resource: { values: [REQUIRED_HEADERS] },
+    });
+    // Re-fetch to get the new headers
+    const refreshed = await getExistingSheetData();
+    return updateSheet(records); // re-call with fresh data
   }
 
   const nameIdx = headers.indexOf('Name');
@@ -144,11 +174,6 @@ async function updateSheet(records) {
   const statusIdx = headers.indexOf('Status');
   const daysIdx = headers.indexOf('Days Remaining');
   const lastNotifiedIdx = headers.indexOf('Last Notified');
-
-  if (phoneIdx === -1) {
-    console.error('❌ Column "Phone" not found in sheet.');
-    return;
-  }
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -285,7 +310,7 @@ async function syncCRM() {
     console.log(`📊 CRM reports ${total} total customers.`);
 
     if (total === 0) {
-      throw new Error('No customers found. Check CRM_DATA_API_URL and filterType.');
+      throw new Error('No customers found.');
     }
 
     // --- Paginate: fetch all pages ---
@@ -297,14 +322,13 @@ async function syncCRM() {
       const rows = await fetchPage(page, fetched, length);
       allRows = allRows.concat(rows);
       fetched += length;
-      // Avoid overwhelming the server – small delay
       await new Promise(resolve => setTimeout(resolve, 200));
     }
 
     console.log(`📥 Fetched ${allRows.length} customer records total.`);
 
     if (allRows.length === 0) {
-      throw new Error('No records returned after pagination.');
+      throw new Error('No records returned.');
     }
 
     const records = allRows.map(extractRecord);
