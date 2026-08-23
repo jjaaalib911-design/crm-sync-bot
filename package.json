@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "puppeteer": "^22.0.0",
-    "googleapis": "^131.0.0"
+    "googleapis": "^131.0.0",
+    "csv-parse": "^5.5.6"
   }
 }
