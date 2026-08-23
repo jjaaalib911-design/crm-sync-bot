@@ -1,5 +1,5 @@
 // ====================================================
-// index.js — CRM Live Data Sync (auto-detects the correct filter to see ALL customers)
+// index.js — CRM Live Data Sync (overwrites sheet every 5 min)
 // Deploy on Railway
 // ====================================================
 
@@ -174,108 +174,57 @@ async function findBestFilterType(page) {
   return best;
 }
 
-async function getExistingSheetData() {
-  try {
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: 'Customers!A1:Z',
-    });
-    const rows = response.data.values;
-    if (!rows || rows.length === 0) return { headers: [], data: [], phoneMap: new Map() };
-    const headers = rows[0];
-    const data = rows.slice(1);
-    const phoneIndex = headers.indexOf(UNIQUE_KEY);
-    const phoneMap = new Map();
-    if (phoneIndex !== -1) {
-      data.forEach((row, idx) => {
-        const phone = (row[phoneIndex] || '').trim();
-        if (phone) phoneMap.set(phone, idx);
-      });
-    }
-    return { headers, data, phoneMap };
-  } catch (err) {
-    console.error('Failed to read sheet:', err.message);
-    return { headers: [], data: [], phoneMap: new Map() };
-  }
-}
-
-async function updateSheet(records) {
-  const { headers, data, phoneMap } = await getExistingSheetData();
-  if (headers.length === 0) {
-    console.error('Sheet headers not found. Make sure the Customers tab has header row 1 filled in.');
-    return;
-  }
-
-  const idIdx = headers.indexOf('ID No.');
-  const nameIdx = headers.indexOf('Name');
-  const phoneIdx = headers.indexOf('Phone');
-  const addressIdx = headers.indexOf('Address');
-  const pkgIdx = headers.indexOf('Package');
-  const amountPaidIdx = headers.indexOf('Amount Paid');
-  const activationIdx = headers.indexOf('Activation Date');
-  const paymentDateIdx = headers.indexOf('Payment Date');
-  const expiryIdx = headers.indexOf('Expiry Date');
-  const statusIdx = headers.indexOf('Status');
-  const daysIdx = headers.indexOf('Days Remaining');
-  const lastNotifiedIdx = headers.indexOf('Last Notified');
-
-  if (phoneIdx === -1) {
-    console.error('Column "Phone" not found in sheet.');
-    return;
-  }
+// ---------- OVERWRITE SHEET FUNCTION ----------
+async function overwriteSheet(records) {
+  // Define headers (must match your sheet columns)
+  const HEADERS = [
+    'ID No.', 'Name', 'Phone', 'Address', 'Package',
+    'Amount Paid', 'Payment Date', 'Activation Date',
+    'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
+  ];
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const updatedData = [...data];
-  const newRows = [];
-  let updatedCount = 0, appendedCount = 0;
-
-  for (const rec of records) {
-    if (!rec.phone) continue;
-
-    const sheetRow = new Array(headers.length).fill('');
-    if (idIdx !== -1) sheetRow[idIdx] = rec.username;
-    if (nameIdx !== -1) sheetRow[nameIdx] = rec.name;
-    if (phoneIdx !== -1) sheetRow[phoneIdx] = rec.phone;
-    if (addressIdx !== -1) sheetRow[addressIdx] = rec.address;
-    if (pkgIdx !== -1) sheetRow[pkgIdx] = rec.pkg;
-    if (amountPaidIdx !== -1) sheetRow[amountPaidIdx] = getPriceForPackage(rec.pkg);
-    if (activationIdx !== -1) sheetRow[activationIdx] = formatDateForSheet(rec.activationDate);
-    if (paymentDateIdx !== -1) sheetRow[paymentDateIdx] = formatDateForSheet(rec.activationDate);
-    if (expiryIdx !== -1) sheetRow[expiryIdx] = formatDateForSheet(rec.expiryDate);
-
+  // Build rows for each record
+  const rows = records.map(rec => {
+    if (!rec.phone) return null;
+    const price = getPriceForPackage(rec.pkg);
+    const activationDateStr = formatDateForSheet(rec.activationDate);
+    const paymentDateStr = activationDateStr; // Payment date = activation date
+    const expiryDateStr = formatDateForSheet(rec.expiryDate);
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    if (statusIdx !== -1) sheetRow[statusIdx] = status;
-    if (daysIdx !== -1) sheetRow[daysIdx] = daysRemaining;
+    return [
+      rec.username,           // ID No.
+      rec.name,               // Name
+      rec.phone,              // Phone
+      rec.address,            // Address
+      rec.pkg,                // Package
+      price,                  // Amount Paid
+      paymentDateStr,         // Payment Date
+      activationDateStr,      // Activation Date
+      expiryDateStr,          // Expiry Date
+      status,                 // Status
+      daysRemaining,          // Days Remaining
+      ''                      // Last Notified (blank)
+    ];
+  }).filter(row => row !== null);
 
-    const existingIndex = phoneMap.get(rec.phone);
-    if (existingIndex !== undefined) {
-      if (lastNotifiedIdx !== -1 && data[existingIndex] && data[existingIndex][lastNotifiedIdx]) {
-        sheetRow[lastNotifiedIdx] = data[existingIndex][lastNotifiedIdx];
-      }
-      updatedData[existingIndex] = sheetRow;
-      updatedCount++;
-    } else {
-      newRows.push(sheetRow);
-      appendedCount++;
-    }
-  }
+  // Combine headers and rows
+  const allData = [HEADERS, ...rows];
 
-  const allRows = updatedData.concat(newRows);
-  if (allRows.length > 0) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: GOOGLE_SHEET_ID,
-      range: `Customers!A2:Z${allRows.length + 1}`,
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: allRows },
-    });
-    console.log(`Sheet updated: ${updatedCount} updated, ${appendedCount} appended.`);
-  } else {
-    console.log('No changes to sheet.');
-  }
+  // Write all data starting from A1 of the "Customers" sheet
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: 'Customers!A1',
+    valueInputOption: 'USER_ENTERED',
+    resource: { values: allData },
+  });
+
+  console.log(`✅ Sheet overwritten with ${rows.length} rows.`);
 }
 
+// ---------- Main sync ----------
 async function syncCRM() {
   console.log(`[${new Date().toISOString()}] Sync started...`);
   let browser = null;
@@ -322,7 +271,9 @@ async function syncCRM() {
     console.log(JSON.stringify(rawRows[0]));
 
     const records = rawRows.map(extractRecord);
-    await updateSheet(records);
+
+    // Overwrite sheet with fresh data
+    await overwriteSheet(records);
 
     console.log(`[${new Date().toISOString()}] Sync completed.`);
 
