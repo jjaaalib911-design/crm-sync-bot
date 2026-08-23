@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL: Expiry → Activation -30d) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – CORRECT TABLE SELECTION) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -72,7 +72,6 @@ const INDICES = {
   pkg: 6,      // Package → Package
   expiry: 9    // Expiry → Expiry Date (from CRM)
 };
-// --------------------------------------------------
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -185,9 +184,9 @@ async function writeFreshSheet(records) {
     const price = getPriceForPackage(rec.pkg);
     const expiryDateStr = formatDateForSheet(rec.expiryDate);
     const activationDate = new Date(rec.expiryDate);
-    activationDate.setDate(activationDate.getDate() - 30); // Activation = Expiry - 30 days
+    activationDate.setDate(activationDate.getDate() - 30);
     const activationDateStr = formatDateForSheet(activationDate);
-    const paymentDateStr = activationDateStr; // same as activation
+    const paymentDateStr = activationDateStr;
     const row = [
       rec.id, rec.name, rec.phone, rec.address, rec.pkg,
       price, paymentDateStr, activationDateStr, expiryDateStr,
@@ -209,9 +208,10 @@ async function writeFreshSheet(records) {
   console.log(`✅ Sheet overwritten with ${newRows.length} rows (${oldNotified.size} Last Notified preserved).`);
 }
 
-// ---------- Find the best table (with Full Name, Address, Expiry) ----------
+// ---------- Find the correct table (using multiple strategies) ----------
 async function findBestTable(page) {
   return await page.evaluate(() => {
+    // Strategy 1: Look for table with "Full Name", "Address", "Expiry"
     const tables = document.querySelectorAll('table');
     let bestScore = -Infinity;
     let bestTable = null;
@@ -220,23 +220,46 @@ async function findBestTable(page) {
     for (const table of tables) {
       const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
       const headers = Array.from(ths).map(cell => cell.innerText.trim());
-      const targetCols = ['Full Name', 'Address', 'Expiry'];
-      let score = 0;
-      for (const col of targetCols) {
-        if (headers.some(h => h.toLowerCase().includes(col.toLowerCase()))) {
-          score += 1;
-        }
-      }
-      score += headers.length * 0.1;
-      const hasAction = headers.some(h => h.toLowerCase().includes('action'));
+      // Check for presence of target columns
+      const hasFullName = headers.some(h => h.toLowerCase().includes('full name'));
+      const hasAddress = headers.some(h => h.toLowerCase().includes('address'));
       const hasExpiry = headers.some(h => h.toLowerCase().includes('expiry'));
-      if (hasAction && !hasExpiry) score -= 5;
+      const hasCreated = headers.some(h => h.toLowerCase().includes('created'));
+      // Score: +10 for each required column, + number of columns
+      let score = 0;
+      if (hasFullName) score += 10;
+      if (hasAddress) score += 10;
+      if (hasExpiry) score += 5;
+      if (hasCreated) score += 5;
+      score += headers.length; // prefer tables with more columns
+      // Penalize if it has "Action" but not "Full Name" (likely the summary table)
+      if (headers.some(h => h.toLowerCase().includes('action')) && !hasFullName) {
+        score -= 20;
+      }
       if (score > bestScore) {
         bestScore = score;
         bestTable = table;
         bestHeaders = headers;
       }
     }
+
+    // If we didn't find a table with Full Name and Address, try to find by ID (common DataTables)
+    if (!bestTable || !bestHeaders.some(h => h.toLowerCase().includes('full name'))) {
+      // Look for table with id containing "DataTables" or "user_list"
+      for (const table of tables) {
+        const id = table.id || '';
+        if (id.toLowerCase().includes('datatables') || id.toLowerCase().includes('userlist') || id.toLowerCase().includes('customer')) {
+          const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+          const headers = Array.from(ths).map(cell => cell.innerText.trim());
+          if (headers.length > 5) {
+            bestTable = table;
+            bestHeaders = headers;
+            break;
+          }
+        }
+      }
+    }
+
     return { headers: bestHeaders, success: bestTable !== null };
   });
 }
@@ -268,6 +291,7 @@ async function syncCRM() {
 
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Wait for the page to fully render
     await page.waitForSelector('table', { timeout: 30000 });
 
     // ----- Set page size to 10 -----
@@ -299,7 +323,7 @@ async function syncCRM() {
     }
     console.log(`✅ Selected table with headers: ${headers.join(' | ')}`);
 
-    // ----- Paginate and scrape -----
+    // ----- Paginate and scrape using the same table selection -----
     let allRows = [];
     let pageNum = 0;
     let maxPages = 100;
@@ -308,6 +332,7 @@ async function syncCRM() {
       pageNum++;
       console.log(`📄 Scraping page ${pageNum}...`);
 
+      // Re‑evaluate the best table on each page (it may change)
       const rows = await page.evaluate(() => {
         const tables = document.querySelectorAll('table');
         let bestScore = -Infinity;
@@ -315,18 +340,28 @@ async function syncCRM() {
         for (const table of tables) {
           const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
           const headers = Array.from(ths).map(cell => cell.innerText.trim());
-          const targetCols = ['Full Name', 'Address', 'Expiry'];
-          let score = 0;
-          for (const col of targetCols) {
-            if (headers.some(h => h.toLowerCase().includes(col.toLowerCase()))) score += 1;
-          }
-          score += headers.length * 0.1;
-          const hasAction = headers.some(h => h.toLowerCase().includes('action'));
+          const hasFullName = headers.some(h => h.toLowerCase().includes('full name'));
+          const hasAddress = headers.some(h => h.toLowerCase().includes('address'));
           const hasExpiry = headers.some(h => h.toLowerCase().includes('expiry'));
-          if (hasAction && !hasExpiry) score -= 5;
+          let score = 0;
+          if (hasFullName) score += 10;
+          if (hasAddress) score += 10;
+          if (hasExpiry) score += 5;
+          score += headers.length;
+          if (headers.some(h => h.toLowerCase().includes('action')) && !hasFullName) score -= 20;
           if (score > bestScore) {
             bestScore = score;
             bestTable = table;
+          }
+        }
+        // Fallback to ID if needed
+        if (!bestTable) {
+          for (const table of tables) {
+            const id = table.id || '';
+            if (id.toLowerCase().includes('datatables') || id.toLowerCase().includes('userlist')) {
+              bestTable = table;
+              break;
+            }
           }
         }
         if (!bestTable) return [];
@@ -396,7 +431,7 @@ async function syncCRM() {
       console.log(`Using indices: ID=${INDICES.id}, Name=${INDICES.name}, Phone=${INDICES.phone}, Address=${INDICES.address}, Package=${INDICES.pkg}, Expiry=${INDICES.expiry}`);
     }
 
-    // ----- Build records using Expiry from CRM, compute Activation = Expiry - 30 days -----
+    // ----- Build records -----
     const records = allRows.map(row => {
       const id = stripHtml(row[INDICES.id] || '');
       const name = stripHtml(row[INDICES.name] || '');
@@ -404,7 +439,6 @@ async function syncCRM() {
       const address = stripHtml(row[INDICES.address] || '');
       const pkg = stripHtml(row[INDICES.pkg] || '');
       const expiryDate = parseCrmDate(row[INDICES.expiry] || '');
-      // Activation = Expiry - 30 days
       let activationDate = null;
       if (expiryDate) {
         activationDate = new Date(expiryDate);
