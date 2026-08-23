@@ -317,6 +317,10 @@ async function syncCRM() {
       throw new Error('No records returned even after testing filter types.');
     }
 
+    // DEBUG: show the raw structure of the first record so we can verify field positions
+    console.log('RAW first record (for column verification):');
+    console.log(JSON.stringify(rawRows[0]));
+
     const records = rawRows.map(extractRecord);
     await updateSheet(records);
 
