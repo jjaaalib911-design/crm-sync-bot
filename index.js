@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (FINAL – with your prices + extended timeouts) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – with protocolTimeout) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -49,7 +49,7 @@ const REQUIRED_HEADERS = [
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
 
-// ---------- Your package prices ----------
+// ---------- Package prices ----------
 const PACKAGE_PRICES = {
   '7+7Mbps': 2200,
   '3+3Mbps': 1700,
@@ -204,13 +204,13 @@ async function syncCRM() {
     browser = await puppeteer.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      protocolTimeout: 120000,  // 2 minutes for protocol calls
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
     console.log('📍 Logging in...');
-    // Increased timeout to 60s and use domcontentloaded
     await page.goto(CRM_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.type('input[name="username"]', CRM_USERNAME, { delay: 30 });
     await page.type('input[name="password"]', CRM_PASSWORD, { delay: 30 });
@@ -223,7 +223,7 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     // Wait for table to be present
-    await page.waitForSelector('table', { timeout: 60000 });
+    await page.waitForSelector('table', { timeout: 30000 });
 
     // ----- Set "Show entries" to 1000 -----
     console.log('🔍 Setting dropdown to 1000...');
@@ -244,6 +244,7 @@ async function syncCRM() {
     });
     if (selected) {
       console.log('✅ Selected 1000/All. Waiting for table update...');
+      // Wait for at least one row to appear (allow some time)
       await page.waitForFunction(
         (initial) => document.querySelectorAll('table tr').length > initial,
         { timeout: 15000, args: [initialCount] }
