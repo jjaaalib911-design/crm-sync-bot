@@ -1,9 +1,8 @@
-console.log('🚀 CRM Sync Bot (FINAL SCRAPER) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – with ID No. & robust dropdown) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
 
-// Helper sleep function (replaces deprecated page.waitForTimeout)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ---------- Environment ----------
@@ -46,7 +45,7 @@ const sheets = google.sheets({ version: 'v4', auth });
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
 const REQUIRED_HEADERS = [
-  'Name', 'Phone', 'Address', 'Package',
+  'ID No.', 'Name', 'Phone', 'Address', 'Package',
   'Amount Paid', 'Payment Date', 'Activation Date',
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
@@ -151,14 +150,14 @@ async function writeFreshSheet(records) {
   for (const rec of records) {
     if (!rec.phone) continue;
     const row = [
-      rec.name, rec.phone, rec.address, rec.pkg,
+      rec.id, rec.name, rec.phone, rec.address, rec.pkg,
       '', '', formatDateForSheet(rec.activationDate), formatDateForSheet(rec.expiryDate),
       '', '', ''
     ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    row[8] = status;
-    row[9] = daysRemaining;
-    row[10] = oldNotified.get(rec.phone) || '';
+    row[9] = status;
+    row[10] = daysRemaining;
+    row[11] = oldNotified.get(rec.phone) || '';
     newRows.push(row);
   }
   const allData = [REQUIRED_HEADERS, ...newRows];
@@ -200,58 +199,55 @@ async function syncCRM() {
 
     // ----- Step 1: Find and set "Show entries" to 1000 -----
     console.log('🔍 Searching for "Show entries" dropdown...');
-    const dropdownSet = await page.evaluate(() => {
-      // Common DataTables selectors
+    // First, get the initial row count to detect change
+    const initialRowCount = await page.evaluate(() => document.querySelectorAll('table tr').length);
+    console.log(`Initial row count: ${initialRowCount}`);
+
+    // Try to find the select element
+    const selectSelector = await page.evaluate(() => {
       const selectors = [
         'select[name="example_length"]',
         'select[name="DataTables_Table_0_length"]',
         'select[name="user_list_length"]',
         'select[aria-controls*="DataTables"]',
-        'select:has(option[value="1000"])',
-        'select:has(option[value="-1"])'
+        'select'
       ];
       for (const sel of selectors) {
         const el = document.querySelector(sel);
         if (el && el.tagName === 'SELECT') {
-          const options = el.querySelectorAll('option');
-          for (const opt of options) {
+          // Check if it has an option with value 1000 or -1 or text "All"
+          const opts = el.querySelectorAll('option');
+          for (const opt of opts) {
             if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
-              el.value = opt.value;
-              el.dispatchEvent(new Event('change', { bubbles: true }));
-              return true;
+              return sel;
             }
           }
         }
       }
-      // Fallback: any select with option 1000
-      const allSelects = document.querySelectorAll('select');
-      for (const s of allSelects) {
-        const opts = s.querySelectorAll('option');
-        for (const opt of opts) {
-          if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
-            s.value = opt.value;
-            s.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          }
-        }
-      }
-      return false;
+      return null;
     });
 
-    if (dropdownSet) {
-      console.log('✅ Set "Show entries" to 1000/All. Waiting for table to reload...');
-      // Wait for table to update – wait for more rows than default (e.g., > 30)
+    if (selectSelector) {
+      console.log(`✅ Found select: ${selectSelector}`);
+      // Use page.select() which is more reliable
+      try {
+        await page.select(selectSelector, '1000', '-1');
+        console.log('✅ Selected value 1000 or -1 using page.select()');
+      } catch (e) {
+        // If both fail, try by value
+        await page.select(selectSelector, '1000');
+      }
+      // Wait for the table to redraw – wait for row count to change
       await page.waitForFunction(
-        () => document.querySelectorAll('table tr').length > 30,
-        { timeout: 15000 }
-      ).catch(() => console.warn('Row count did not increase, but continuing...'));
-      // Wait additional 2 seconds for stability
+        (initial) => document.querySelectorAll('table tr').length > initial,
+        { timeout: 15000, args: [initialRowCount] }
+      ).then(() => console.log('✅ Table row count increased.')).catch(() => console.warn('⚠️ Row count did not increase.'));
       await sleep(2000);
     } else {
-      console.warn('⚠️ Could not set "Show entries". Will try pagination next.');
+      console.warn('⚠️ Could not find select dropdown. Will use pagination fallback.');
     }
 
-    // ----- Step 2: Scrape the table (now should have all rows) -----
+    // ----- Step 2: Scrape the table -----
     console.log('📊 Scraping table...');
     const tableData = await page.evaluate(() => {
       const tables = document.querySelectorAll('table');
@@ -268,9 +264,7 @@ async function syncCRM() {
       return data;
     });
 
-    if (tableData.length === 0) {
-      throw new Error('No table data scraped.');
-    }
+    if (tableData.length === 0) throw new Error('No table data scraped.');
 
     // Remove header row if present
     let dataRows = tableData;
@@ -280,14 +274,9 @@ async function syncCRM() {
 
     console.log(`📈 Scraped ${dataRows.length} customer rows (after removing header).`);
 
-    if (dataRows.length === 0) {
-      throw new Error('No data rows found.');
-    }
-
-    // If we got fewer rows than expected, try pagination fallback
-    if (dataRows.length < 50) {
-      console.warn('⚠️ Only scraped ' + dataRows.length + ' rows – trying pagination fallback...');
-      // Try clicking "Next" until no more pages
+    // If still too few, fallback to pagination
+    if (dataRows.length < 100) {
+      console.warn('⚠️ Only scraped ' + dataRows.length + ' rows – falling back to pagination...');
       let allRows = [...dataRows];
       let hasNext = true;
       while (hasNext) {
@@ -322,7 +311,6 @@ async function syncCRM() {
           return data;
         });
         if (newData.length > 0) {
-          // Remove header if it appears again
           let newRows = newData;
           if (newRows[0] && newRows[0].some(cell => cell.match(/Name|Phone|Username|ID/))) {
             newRows = newRows.slice(1);
@@ -330,22 +318,22 @@ async function syncCRM() {
           allRows = allRows.concat(newRows);
           console.log(`   → Added ${newRows.length} rows from next page.`);
         }
-        // Avoid infinite loop
         if (allRows.length > 1000) break;
       }
       dataRows = allRows;
       console.log(`📥 Total after pagination: ${dataRows.length} rows.`);
     }
 
-    // Map columns (indices based on your CRM's table structure)
+    // ----- Map columns -----
     const records = dataRows.map(row => {
-      const name = stripHtml(row[3] || '');
+      const id = stripHtml(row[0] || '');
+      const name = stripHtml(row[4] || '');
       const phone = stripHtml(row[5] || '');
       const address = stripHtml(row[6] || '');
       const pkg = stripHtml(row[7] || '');
       const activationDate = parseCrmDate(row[21] || '');
       const expiryDate = parseCrmDate(row[14] || '');
-      return { name, phone, address, pkg, activationDate, expiryDate };
+      return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
