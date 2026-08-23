@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (AUTO-CLICK EXPORT) starting...');
+console.log('🚀 CRM Sync Bot (EXPORT URL EXTRACTOR) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -119,7 +119,6 @@ async function getTargetSheetName() {
   }
 }
 
-// Read existing Last Notified values
 async function getExistingLastNotified(sheetName) {
   try {
     const response = await sheets.spreadsheets.values.get({
@@ -145,13 +144,10 @@ async function getExistingLastNotified(sheetName) {
   }
 }
 
-// Clear sheet (keep header) and write new data
 async function writeFreshSheet(records) {
   const sheetName = await getTargetSheetName();
-  // Preserve Last Notified from old data
   const oldNotified = await getExistingLastNotified(sheetName);
 
-  // Build new rows
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const newRows = [];
@@ -162,23 +158,21 @@ async function writeFreshSheet(records) {
       rec.phone,
       rec.address,
       rec.pkg,
-      '', // Amount Paid – we don't have this from CRM
-      '', // Payment Date – we don't have this
+      '',
+      '',
       formatDateForSheet(rec.activationDate),
       formatDateForSheet(rec.expiryDate),
       '',
       '',
-      '' // Last Notified – will be restored below
+      ''
     ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    row[8] = status;   // Status
-    row[9] = daysRemaining; // Days Remaining
-    // Restore Last Notified if we have it
+    row[8] = status;
+    row[9] = daysRemaining;
     row[10] = oldNotified.get(rec.phone) || '';
     newRows.push(row);
   }
 
-  // Write header + data
   const allData = [REQUIRED_HEADERS, ...newRows];
   await sheets.spreadsheets.values.update({
     spreadsheetId: GOOGLE_SHEET_ID,
@@ -216,73 +210,87 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ----- Find and click Export button -----
-    console.log('🔍 Searching for Export button...');
-    // Wait for the page to load
-    await page.waitForSelector('body', { timeout: 10000 });
-
-    // Try to find a button/link that triggers export
-    const exportClicked = await page.evaluate(() => {
-      // Look for links with export/csv/download
-      const links = document.querySelectorAll('a, button, input[type="button"], input[type="submit"]');
-      for (const el of links) {
-        const text = (el.innerText || '').toLowerCase();
+    // ----- Find export URL -----
+    console.log('🔍 Searching for export URL...');
+    const exportUrl = await page.evaluate(() => {
+      // Look for links with export/csv/download in href or text
+      const elements = document.querySelectorAll('a, button, input[type="button"], input[type="submit"]');
+      for (const el of elements) {
         const href = el.href || '';
+        const text = (el.innerText || '').toLowerCase();
         const onclick = el.getAttribute('onclick') || '';
+        const dataUrl = el.getAttribute('data-url') || '';
         const className = el.className || '';
         const id = el.id || '';
-        if (text.includes('export') || text.includes('csv') || text.includes('download') ||
-            href.includes('export') || href.includes('csv') || href.includes('download') ||
+        if (href.includes('export') || href.includes('csv') || href.includes('download') ||
+            text.includes('export') || text.includes('csv') || text.includes('download') ||
             onclick.includes('export') || onclick.includes('csv') ||
+            dataUrl.includes('export') || dataUrl.includes('csv') ||
             className.includes('export') || id.includes('export')) {
-          // Click it
-          el.click();
-          return true;
+          // If it's a link, return href
+          if (href && (href.includes('export') || href.includes('csv') || href.includes('download'))) {
+            return href;
+          }
+          // If it's a button with onclick containing window.location
+          if (onclick) {
+            const match = onclick.match(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/);
+            if (match) return match[1];
+            const match2 = onclick.match(/location\.href\s*=\s*['"]([^'"]+)['"]/);
+            if (match2) return match2[1];
+          }
+          // If it has data-url
+          if (dataUrl) return dataUrl;
+          // If it's a button with no URL, we'll click it as fallback
+          // but we return null to indicate we need to click
+          return null;
         }
       }
-      return false;
+      return null;
     });
 
-    if (!exportClicked) {
-      throw new Error('Could not find Export button. Try manual URL or check page structure.');
-    }
-
-    console.log('✅ Export button clicked. Waiting for download...');
-
-    // Intercept the CSV response
     let csvContent = '';
-    const responsePromise = new Promise((resolve) => {
-      page.on('response', async (response) => {
-        const url = response.url();
-        const contentType = response.headers()['content-type'] || '';
-        if (url.includes('export') || url.includes('csv') || url.includes('download') ||
-            contentType.includes('csv') || contentType.includes('text/plain') || contentType.includes('application/octet-stream')) {
-          try {
-            const buffer = await response.buffer();
-            csvContent = buffer.toString('utf8');
-            resolve();
-          } catch (e) {
-            // ignore
-          }
-        }
-      });
-      // Fallback: if no response after 20s, resolve anyway
-      setTimeout(resolve, 20000);
-    });
-
-    await responsePromise;
-
-    // If we didn't get CSV, try to get it from page content (some CRM serve CSV directly)
-    if (!csvContent || csvContent.length < 100) {
-      console.warn('⚠️ No CSV captured via network. Trying page content...');
+    if (exportUrl) {
+      console.log(`✅ Found export URL: ${exportUrl}`);
+      // Navigate to it – should load CSV directly
+      await page.goto(exportUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      // Get page content (should be CSV)
       csvContent = await page.evaluate(() => document.body.innerText);
+      console.log(`📄 Downloaded CSV via URL (${csvContent.length} characters)`);
+    } else {
+      // Fallback: try to click the button and intercept response
+      console.log('⚠️ No export URL found. Trying to click export button and intercept...');
+      const [response] = await Promise.all([
+        page.waitForResponse(res => 
+          res.url().includes('export') || 
+          res.url().includes('csv') || 
+          res.url().includes('download') ||
+          res.headers()['content-type']?.includes('csv') ||
+          res.headers()['content-disposition']?.includes('attachment')
+        ),
+        page.evaluate(() => {
+          const btn = document.querySelector('a[href*="export"], button[onclick*="export"], input[value*="Export"]');
+          if (btn) btn.click();
+        })
+      ]);
+      if (response) {
+        const buffer = await response.buffer();
+        csvContent = buffer.toString('utf8');
+        console.log(`📄 Captured CSV from network (${csvContent.length} characters)`);
+      } else {
+        throw new Error('Could not capture CSV export.');
+      }
     }
 
     if (!csvContent || csvContent.length < 50) {
-      throw new Error('Failed to get CSV content.');
+      throw new Error('CSV content is empty or too short.');
     }
 
-    console.log(`📄 CSV size: ${csvContent.length} characters.`);
+    // ---- Validate that it's actually CSV (has commas, not HTML) ----
+    if (csvContent.includes('<html') || csvContent.includes('<!DOCTYPE')) {
+      console.warn('⚠️ Got HTML instead of CSV. Trying to extract table from HTML...');
+      // Could attempt to scrape table from HTML as fallback, but better to error.
+      throw new Error('Export returned HTML instead of CSV – the export URL may require specific parameters.');
+    }
 
     // ----- Parse CSV -----
     const records = parse(csvContent, {
@@ -292,9 +300,8 @@ async function syncCRM() {
     });
     console.log(`📈 Found ${records.length} customer records.`);
 
-    // Map CSV fields to our record structure
+    // Map to our structure
     const mapped = records.map(row => {
-      // Try to find fields by common names
       const name = row['Full Name'] || row['Name'] || '';
       const phone = row['Phone'] || '';
       const address = row['Address'] || '';
@@ -304,7 +311,6 @@ async function syncCRM() {
       return { name, phone, address, pkg, activationDate, expiryDate };
     });
 
-    // ----- Overwrite sheet with all customers -----
     await writeFreshSheet(mapped);
 
     console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
