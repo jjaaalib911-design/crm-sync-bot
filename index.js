@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (DYNAMIC HEADER MAPPING) starting...');
+console.log('🚀 CRM Sync Bot (FINAL: Correct mapping + auto price) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -15,7 +15,6 @@ const {
   GOOGLE_CREDENTIALS,
 } = process.env;
 
-// ---------- Validate ----------
 const required = [
   'CRM_USERNAME', 'CRM_PASSWORD', 'CRM_LOGIN_URL',
   'CRM_LIST_PAGE_URL', 'GOOGLE_SHEET_ID', 'GOOGLE_CREDENTIALS'
@@ -49,6 +48,21 @@ const REQUIRED_HEADERS = [
   'Amount Paid', 'Payment Date', 'Activation Date',
   'Expiry Date', 'Status', 'Days Remaining', 'Last Notified'
 ];
+
+// ---------- Package → Price mapping (edit this to match your rates) ----------
+const PACKAGE_PRICES = {
+  '7+7Mbps': 2200,    // example – change to your actual prices
+  '3+3Mbps': 1700,
+  '4MB': 1500,
+  '6MB': 1800,
+  '5+5Mbps': 2000,
+  '4+4Mbps': 1800,
+  '10MB': 2300,
+  '30 MB Day': 2500,
+  '50 MB': 8500,
+  // add any other packages you see
+  'default': 0       // if package not found, price = 0
+};
 
 // ---------- Helpers ----------
 function stripHtml(str) {
@@ -86,6 +100,17 @@ function computeStatus(expiryDate, today) {
   else if (diffDays <= REMINDER_WINDOW_DAYS) status = 'Expiring Soon';
   else status = 'Active';
   return { status, daysRemaining: diffDays };
+}
+// Get price for a package
+function getPriceForPackage(pkg) {
+  if (!pkg) return PACKAGE_PRICES.default || 0;
+  // Try exact match, then case‑insensitive
+  if (PACKAGE_PRICES[pkg] !== undefined) return PACKAGE_PRICES[pkg];
+  const lower = pkg.toLowerCase();
+  for (const [key, value] of Object.entries(PACKAGE_PRICES)) {
+    if (key.toLowerCase() === lower) return value;
+  }
+  return PACKAGE_PRICES.default || 0;
 }
 
 // ---------- Sheet functions ----------
@@ -149,15 +174,21 @@ async function writeFreshSheet(records) {
   const newRows = [];
   for (const rec of records) {
     if (!rec.phone) continue;
+    // Amount paid from package
+    const price = getPriceForPackage(rec.pkg);
+    // Payment date = Activation date
+    const activationDateStr = formatDateForSheet(rec.activationDate);
+    const paymentDateStr = activationDateStr;  // same as activation
+    // Build row: ID No., Name, Phone, Address, Package, Amount Paid, Payment Date, Activation Date, Expiry Date, Status, Days Remaining, Last Notified
     const row = [
       rec.id, rec.name, rec.phone, rec.address, rec.pkg,
-      '', '', formatDateForSheet(rec.activationDate), formatDateForSheet(rec.expiryDate),
+      price, paymentDateStr, activationDateStr, formatDateForSheet(rec.expiryDate),
       '', '', ''
     ];
     const { status, daysRemaining } = computeStatus(rec.expiryDate, today);
-    row[9] = status;
-    row[10] = daysRemaining;
-    row[11] = oldNotified.get(rec.phone) || '';
+    row[9] = status;      // Status
+    row[10] = daysRemaining; // Days Remaining
+    row[11] = oldNotified.get(rec.phone) || ''; // Last Notified
     newRows.push(row);
   }
   const allData = [REQUIRED_HEADERS, ...newRows];
@@ -197,166 +228,73 @@ async function syncCRM() {
     console.log('📍 Opening customer list page...');
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // ----- Select dropdown -----
-    console.log('🔍 Searching for "Show entries" dropdown...');
-    const initialRowCount = await page.evaluate(() => document.querySelectorAll('table tr').length);
-    console.log(`Initial row count: ${initialRowCount}`);
-
-    const selectSelector = await page.evaluate(() => {
-      const selectors = [
-        'select[name="example_length"]',
-        'select[name="DataTables_Table_0_length"]',
-        'select[name="user_list_length"]',
-        'select[aria-controls*="DataTables"]',
-        'select'
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.tagName === 'SELECT') {
-          const opts = el.querySelectorAll('option');
-          for (const opt of opts) {
-            if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
-              return sel;
-            }
+    // ----- Set "Show entries" to 1000 -----
+    console.log('🔍 Setting dropdown to 1000...');
+    const initialCount = await page.evaluate(() => document.querySelectorAll('table tr').length);
+    const selected = await page.evaluate(() => {
+      const selects = document.querySelectorAll('select');
+      for (const s of selects) {
+        const opts = s.querySelectorAll('option');
+        for (const opt of opts) {
+          if (opt.value === '1000' || opt.value === '-1' || opt.text.includes('1000') || opt.text.includes('All')) {
+            s.value = opt.value;
+            s.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
           }
         }
       }
-      return null;
+      return false;
     });
-
-    if (selectSelector) {
-      console.log(`✅ Found select: ${selectSelector}`);
-      try {
-        await page.select(selectSelector, '1000', '-1');
-        console.log('✅ Selected value 1000 or -1');
-      } catch (e) {
-        await page.select(selectSelector, '1000');
-      }
+    if (selected) {
+      console.log('✅ Selected 1000/All. Waiting for table update...');
       await page.waitForFunction(
         (initial) => document.querySelectorAll('table tr').length > initial,
-        { timeout: 15000, args: [initialRowCount] }
-      ).then(() => console.log('✅ Table row count increased.')).catch(() => console.warn('⚠️ Row count did not increase.'));
+        { timeout: 15000, args: [initialCount] }
+      ).catch(() => console.warn('Row count did not increase.'));
       await sleep(2000);
     } else {
-      console.warn('⚠️ Could not find select dropdown. Will use pagination fallback.');
+      console.warn('⚠️ Could not set dropdown, using default page.');
     }
 
-    // ----- Scrape table with headers -----
-    console.log('📊 Scraping table with headers...');
-    const { headers, rows } = await page.evaluate(() => {
+    // ----- Scrape table -----
+    console.log('📊 Scraping table...');
+    const tableData = await page.evaluate(() => {
       const table = document.querySelector('table');
-      if (!table) return { headers: [], rows: [] };
-      const allRows = table.querySelectorAll('tr');
-      if (allRows.length === 0) return { headers: [], rows: [] };
-      // First row as headers
-      const headerCells = allRows[0].querySelectorAll('th, td');
-      const headers = Array.from(headerCells).map(cell => cell.innerText.trim());
-      // Data rows
-      const dataRows = [];
-      for (let i = 1; i < allRows.length; i++) {
-        const cells = allRows[i].querySelectorAll('th, td');
-        const rowData = Array.from(cells).map(cell => cell.innerText.trim());
-        if (rowData.length > 0) dataRows.push(rowData);
-      }
-      return { headers, rows: dataRows };
+      if (!table) return [];
+      const rows = table.querySelectorAll('tr');
+      const data = [];
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('th, td');
+        const rowData = [];
+        cells.forEach(cell => rowData.push(cell.innerText.trim()));
+        if (rowData.length > 0) data.push(rowData);
+      });
+      return data;
     });
 
-    if (rows.length === 0) throw new Error('No data rows found.');
+    if (tableData.length === 0) throw new Error('No table found.');
 
-    console.log(`📈 Scraped ${rows.length} data rows.`);
-
-    // ----- Dynamic column mapping by header text -----
-    const headerMap = {};
-    headers.forEach((h, idx) => {
-      const key = h.toLowerCase().replace(/[^a-z0-9]/g, '');
-      headerMap[key] = idx;
-    });
-
-    // Map our target fields to header names
-    const fieldMapping = {
-      id: ['#id', 'id', 'userid', 'customerid'],
-      name: ['fullname', 'name', 'full name', 'customer name'],
-      phone: ['phone', 'mobile', 'contact'],
-      address: ['address', 'location'],
-      pkg: ['package', 'plan', 'bandwidth'],
-      activationDate: ['created', 'creationdate', 'createddate', 'activationdate', 'activation'],
-      expiryDate: ['expiry', 'expiration', 'expirydate', 'validuntil']
-    };
-
-    function findIndex(field) {
-      const possible = fieldMapping[field];
-      for (const p of possible) {
-        const key = p.replace(/[^a-z0-9]/g, '');
-        if (headerMap[key] !== undefined) return headerMap[key];
-      }
-      return -1;
+    // Remove header row if it contains typical headers
+    let dataRows = tableData;
+    if (dataRows[0] && dataRows[0].some(cell => cell.match(/Name|Phone|Username|ID|Package/))) {
+      dataRows = dataRows.slice(1);
     }
 
-    const idIdx = findIndex('id');
-    const nameIdx = findIndex('name');
-    const phoneIdx = findIndex('phone');
-    const addressIdx = findIndex('address');
-    const pkgIdx = findIndex('pkg');
-    const activationIdx = findIndex('activationDate');
-    const expiryIdx = findIndex('expiryDate');
+    console.log(`📈 Scraped ${dataRows.length} rows (after removing header).`);
 
-    console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Activation=${activationIdx}, Expiry=${expiryIdx}`);
-
-    // If any required index is missing, fallback to fixed indices from CSV structure
-    if (idIdx === -1 || nameIdx === -1 || phoneIdx === -1 || addressIdx === -1 || pkgIdx === -1 || activationIdx === -1 || expiryIdx === -1) {
-      console.warn('⚠️ Some headers not found – falling back to fixed indices (based on CSV order).');
-      // Fallback: assume order from your CSV: 0=ID, 4=FullName, 6=Phone, 7=Address, 8=Package, 22=Created, 15=Expiry
-      // But we'll use the indices that were found if any
-      const fallback = {
-        id: 0,
-        name: 4,
-        phone: 6,
-        address: 7,
-        pkg: 8,
-        activation: 22,
-        expiry: 15
-      };
-      // Override only if not found
-      const finalIdIdx = idIdx !== -1 ? idIdx : fallback.id;
-      const finalNameIdx = nameIdx !== -1 ? nameIdx : fallback.name;
-      const finalPhoneIdx = phoneIdx !== -1 ? phoneIdx : fallback.phone;
-      const finalAddressIdx = addressIdx !== -1 ? addressIdx : fallback.address;
-      const finalPkgIdx = pkgIdx !== -1 ? pkgIdx : fallback.pkg;
-      const finalActivationIdx = activationIdx !== -1 ? activationIdx : fallback.activation;
-      const finalExpiryIdx = expiryIdx !== -1 ? expiryIdx : fallback.expiry;
-
-      // Re-map
-      const records = rows.map(row => {
-        const id = stripHtml(row[finalIdIdx] || '');
-        const name = stripHtml(row[finalNameIdx] || '');
-        const phone = stripHtml(row[finalPhoneIdx] || '');
-        const address = stripHtml(row[finalAddressIdx] || '');
-        const pkg = stripHtml(row[finalPkgIdx] || '');
-        const activationDate = parseCrmDate(row[finalActivationIdx] || '');
-        const expiryDate = parseCrmDate(row[finalExpiryIdx] || '');
-        return { id, name, phone, address, pkg, activationDate, expiryDate };
-      }).filter(r => r.phone);
-
-      console.log(`✅ Using fallback mapping – ${records.length} records.`);
-      await writeFreshSheet(records);
-      console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
-      return;
-    }
-
-    // ----- Use dynamic mapping -----
-    const records = rows.map(row => {
-      const id = stripHtml(row[idIdx] || '');
-      const name = stripHtml(row[nameIdx] || '');
-      const phone = stripHtml(row[phoneIdx] || '');
-      const address = stripHtml(row[addressIdx] || '');
-      const pkg = stripHtml(row[pkgIdx] || '');
-      const activationDate = parseCrmDate(row[activationIdx] || '');
-      const expiryDate = parseCrmDate(row[expiryIdx] || '');
+    // ----- Map using correct indices -----
+    const records = dataRows.map(row => {
+      const id = stripHtml(row[3] || '');      // Username -> ID No.
+      const name = stripHtml(row[4] || '');    // Full Name
+      const phone = stripHtml(row[6] || '');   // Phone
+      const address = stripHtml(row[7] || ''); // Address
+      const pkg = stripHtml(row[8] || '');     // Package
+      const activationDate = parseCrmDate(row[22] || ''); // Created
+      const expiryDate = parseCrmDate(row[15] || '');     // Expiry
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
-
     await writeFreshSheet(records);
 
     console.log(`[${new Date().toISOString()}] ✅ Sync completed.`);
