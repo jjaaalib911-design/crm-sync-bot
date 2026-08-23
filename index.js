@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (HARDCODED INDICES) starting...');
+console.log('🚀 CRM Sync Bot (HEADER DETECTION + FALLBACK) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -223,7 +223,7 @@ async function syncCRM() {
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
-    // ----- Set page size to 10 (or whatever works) -----
+    // ----- Set page size to 10 (to be safe) -----
     console.log('🔍 Setting page size to 10...');
     try {
       await page.evaluate(() => {
@@ -244,6 +244,68 @@ async function syncCRM() {
       console.warn('⚠️ Could not set page size:', e.message);
     }
 
+    // ----- Find the correct table (with Full Name, Address, Created) and get its headers -----
+    console.log('🔍 Searching for the correct table with headers...');
+    const tableInfo = await page.evaluate(() => {
+      const tables = document.querySelectorAll('table');
+      let bestTable = null;
+      let bestHeaders = [];
+      let bestScore = -1;
+      for (const table of tables) {
+        const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+        const headers = Array.from(ths).map(cell => cell.innerText.trim());
+        // Score by presence of key columns
+        const keys = ['Full Name', 'Address', 'Created'];
+        let score = 0;
+        for (const k of keys) {
+          if (headers.some(h => h.toLowerCase().includes(k.toLowerCase()))) score++;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestTable = table;
+          bestHeaders = headers;
+        }
+      }
+      if (!bestTable) return { headers: [], success: false };
+      return { headers: bestHeaders, success: true };
+    });
+
+    if (!tableInfo.success || tableInfo.headers.length === 0) {
+      throw new Error('Could not find table with Full Name, Address, Created.');
+    }
+    const headers = tableInfo.headers;
+    console.log(`✅ Found table with headers: ${headers.join(' | ')}`);
+
+    // ----- Map columns by header name -----
+    function findIndex(keywords) {
+      for (const kw of keywords) {
+        const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    const idIdx = findIndex(['username', 'user id']);
+    const nameIdx = findIndex(['full name', 'fullname']);
+    const phoneIdx = findIndex(['phone', 'mobile']);
+    const addressIdx = findIndex(['address', 'location']);
+    const pkgIdx = findIndex(['package', 'plan']);
+    const expiryIdx = findIndex(['expiry', 'expiration']);
+    const createdIdx = findIndex(['created', 'creation']);
+
+    // If any index is -1, use hardcoded fallback based on the observed order (assuming NID exists)
+    // Order: #ID(0), Photo(1), Username(2), Full Name(3), NID(4), Phone(5), Address(6), Package(7), Seller(8), Balance(9), On/Off(10), Expiry(11), Created(12)
+    const fallback = { id: 2, name: 3, phone: 5, address: 6, pkg: 7, expiry: 11, created: 12 };
+    const finalId = idIdx !== -1 ? idIdx : fallback.id;
+    const finalName = nameIdx !== -1 ? nameIdx : fallback.name;
+    const finalPhone = phoneIdx !== -1 ? phoneIdx : fallback.phone;
+    const finalAddress = addressIdx !== -1 ? addressIdx : fallback.address;
+    const finalPkg = pkgIdx !== -1 ? pkgIdx : fallback.pkg;
+    const finalExpiry = expiryIdx !== -1 ? expiryIdx : fallback.expiry;
+    const finalCreated = createdIdx !== -1 ? createdIdx : fallback.created;
+
+    console.log(`Mapped indices: ID=${finalId}, Name=${finalName}, Phone=${finalPhone}, Address=${finalAddress}, Package=${finalPkg}, Expiry=${finalExpiry}, Created=${finalCreated}`);
+
     // ----- Paginate and scrape all rows -----
     let allRows = [];
     let pageNum = 0;
@@ -253,24 +315,39 @@ async function syncCRM() {
       pageNum++;
       console.log(`📄 Scraping page ${pageNum}...`);
 
-      // Extract data rows from the table (any table, but we assume there's only one main table)
+      // Extract data rows from the selected table (using the same table selection logic)
       const rows = await page.evaluate(() => {
-        const table = document.querySelector('table');
-        if (!table) return [];
-        const trs = table.querySelectorAll('tr');
-        const dataRows = [];
+        const tables = document.querySelectorAll('table');
+        let bestTable = null;
+        let bestScore = -1;
+        for (const table of tables) {
+          const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+          const headers = Array.from(ths).map(cell => cell.innerText.trim());
+          const keys = ['Full Name', 'Address', 'Created'];
+          let score = 0;
+          for (const k of keys) {
+            if (headers.some(h => h.toLowerCase().includes(k.toLowerCase()))) score++;
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestTable = table;
+          }
+        }
+        if (!bestTable) return [];
+        const trs = bestTable.querySelectorAll('tr');
+        const data = [];
         for (let i = 1; i < trs.length; i++) {
           const tds = trs[i].querySelectorAll('th, td');
           const rowData = Array.from(tds).map(cell => cell.innerText.trim());
-          if (rowData.length > 0) dataRows.push(rowData);
+          if (rowData.length > 0) data.push(rowData);
         }
-        return dataRows;
+        return data;
       });
 
       console.log(`   → Found ${rows.length} rows on page ${pageNum}`);
       allRows = allRows.concat(rows);
 
-      // Check Next button
+      // Check for Next button
       const nextInfo = await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
@@ -317,30 +394,29 @@ async function syncCRM() {
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Map columns using HARDCODED indices (based on your table order) -----
-    // Table order: #ID(0), Photo(1), Username(2), Full Name(3), Phone(4), Address(5), Package(6), Balance(7), On/Off(8), Expiry(9), Created(10), Action(11)
-    const idxId = 2;       // Username
-    const idxName = 3;     // Full Name
-    const idxPhone = 4;    // Phone
-    const idxAddress = 5;  // Address
-    const idxPkg = 6;      // Package
-    const idxExpiry = 9;   // Expiry
-    const idxCreated = 10; // Created
+    // ----- Log a sample row to debug -----
+    if (allRows.length > 0) {
+      console.log('🔍 Sample row (raw):', allRows[0]);
+    }
 
-    console.log(`Using hardcoded indices: ID=${idxId}, Name=${idxName}, Phone=${idxPhone}, Address=${idxAddress}, Package=${idxPkg}, Expiry=${idxExpiry}, Created=${idxCreated}`);
-
+    // ----- Build records using the mapped indices -----
     const records = allRows.map(row => {
-      const id = stripHtml(row[idxId] || '');
-      const name = stripHtml(row[idxName] || '');
-      const phone = stripHtml(row[idxPhone] || '');
-      const address = stripHtml(row[idxAddress] || '');
-      const pkg = stripHtml(row[idxPkg] || '');
-      const activationDate = parseCrmDate(row[idxCreated] || '');
-      const expiryDate = parseCrmDate(row[idxExpiry] || '');
+      const id = stripHtml(row[finalId] || '');
+      const name = stripHtml(row[finalName] || '');
+      const phone = stripHtml(row[finalPhone] || '');
+      const address = stripHtml(row[finalAddress] || '');
+      const pkg = stripHtml(row[finalPkg] || '');
+      const activationDate = parseCrmDate(row[finalCreated] || '');
+      const expiryDate = parseCrmDate(row[finalExpiry] || '');
       return { id, name, phone, address, pkg, activationDate, expiryDate };
     }).filter(r => r.phone);
 
     console.log(`✅ Filtered to ${records.length} valid customer records.`);
+
+    // Log first mapped record to verify
+    if (records.length > 0) {
+      console.log('🔍 Sample mapped record:', records[0]);
+    }
 
     await writeFreshSheet(records);
 
