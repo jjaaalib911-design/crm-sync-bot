@@ -1,5 +1,5 @@
 // ====================================================
-// index.js — CRM Live Data Sync (with header validation)
+// index.js — CRM Live Data Sync (with full pagination)
 // Deploy on Railway — runs every 5 minutes, forever.
 // ====================================================
 
@@ -123,7 +123,6 @@ async function getExistingSheetData() {
     const headers = rows[0];
     const data = rows.slice(1);
     
-    // Validate that all required headers exist
     const missing = REQUIRED_HEADERS.filter(h => !headers.includes(h));
     if (missing.length > 0) {
       console.error(`❌ Missing headers: ${missing.join(', ')}`);
@@ -151,7 +150,6 @@ async function getExistingSheetData() {
 async function updateSheet(records) {
   const { headers, data, phoneMap } = await getExistingSheetData();
   
-  // If sheet was empty, create headers
   if (headers.length === 0) {
     console.log('📝 Creating header row...');
     await sheets.spreadsheets.values.update({
@@ -160,9 +158,8 @@ async function updateSheet(records) {
       valueInputOption: 'USER_ENTERED',
       resource: { values: [REQUIRED_HEADERS] },
     });
-    // Re-fetch to get the new headers
     const refreshed = await getExistingSheetData();
-    return updateSheet(records); // re-call with fresh data
+    return updateSheet(records);
   }
 
   const nameIdx = headers.indexOf('Name');
