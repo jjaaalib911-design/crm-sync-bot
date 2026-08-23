@@ -1,4 +1,4 @@
-console.log('🚀 CRM Sync Bot (PAGINATION FIXED) starting...');
+console.log('🚀 CRM Sync Bot (FINAL – correct table) starting...');
 
 const puppeteer = require('puppeteer');
 const { google } = require('googleapis');
@@ -223,114 +223,154 @@ async function syncCRM() {
     await page.goto(CRM_LIST_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForSelector('table', { timeout: 30000 });
 
-    // ----- Set "Show entries" to 100 (or 50 if 100 not available) -----
-    console.log('🔍 Setting dropdown to 100...');
-    const pageSize = await page.evaluate(() => {
-      const selects = document.querySelectorAll('select');
-      for (const s of selects) {
-        const opts = s.querySelectorAll('option');
-        for (const opt of opts) {
-          const val = opt.value;
-          if (val === '100' || val === '50' || val === '10') {
-            s.value = val;
-            s.dispatchEvent(new Event('change', { bubbles: true }));
-            return parseInt(val);
-          }
+    // ----- Choose the correct table (with Full Name, Address, Created) -----
+    console.log('🔍 Searching for the correct table...');
+    const tableInfo = await page.evaluate(() => {
+      const tables = document.querySelectorAll('table');
+      let bestTable = null;
+      let bestScore = -1;
+      let bestHeaders = [];
+      for (const table of tables) {
+        const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+        const headers = Array.from(ths).map(cell => cell.innerText.trim());
+        // Score: count of how many of our target columns are present
+        const target = ['Full Name', 'Address', 'Created'];
+        let score = 0;
+        for (const t of target) {
+          if (headers.some(h => h.includes(t))) score++;
+        }
+        // Also prefer tables with more columns
+        score += headers.length * 0.1; // slight bias for larger tables
+        if (score > bestScore) {
+          bestScore = score;
+          bestTable = table;
+          bestHeaders = headers;
         }
       }
-      return null;
+      if (!bestTable) return { headers: [], index: -1 };
+      // Find index of this table among all tables
+      const allTables = document.querySelectorAll('table');
+      let idx = 0;
+      for (const t of allTables) {
+        if (t === bestTable) break;
+        idx++;
+      }
+      return { headers: bestHeaders, index: idx };
     });
 
-    if (pageSize) {
-      console.log(`✅ Selected ${pageSize}. Waiting for table update...`);
+    if (tableInfo.index === -1 || tableInfo.headers.length === 0) {
+      throw new Error('Could not find the correct table with Full Name, Address, Created.');
+    }
+    const headers = tableInfo.headers;
+    console.log(`✅ Selected table with headers: ${headers.join(' | ')}`);
+    console.log(`Table index: ${tableInfo.index}`);
+
+    // We'll need to select the table each time we navigate; we can use the index to find it.
+    // But after clicking Next, the table structure remains; we can still use the index.
+    // However, it's safer to re-identify the table by headers each time.
+    // We'll implement a helper to get the table rows from the correct table.
+    const getTableData = async () => {
+      return await page.evaluate((targetHeaders) => {
+        const tables = document.querySelectorAll('table');
+        let bestTable = null;
+        let bestScore = -1;
+        for (const table of tables) {
+          const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
+          const headers = Array.from(ths).map(cell => cell.innerText.trim());
+          let score = 0;
+          for (const h of targetHeaders) {
+            if (headers.some(th => th.includes(h))) score++;
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestTable = table;
+          }
+        }
+        if (!bestTable) return [];
+        const rows = bestTable.querySelectorAll('tr');
+        const data = [];
+        for (let i = 1; i < rows.length; i++) {
+          const cells = rows[i].querySelectorAll('th, td');
+          const rowData = Array.from(cells).map(cell => cell.innerText.trim());
+          if (rowData.length > 0) data.push(rowData);
+        }
+        return data;
+      }, ['Full Name', 'Address', 'Created']);
+    };
+
+    // ----- Set page size -----
+    console.log('🔍 Setting page size to 50...');
+    try {
+      await page.evaluate(() => {
+        const selects = document.querySelectorAll('select');
+        for (const s of selects) {
+          const opts = s.querySelectorAll('option');
+          for (const opt of opts) {
+            if (opt.value === '50' || opt.value === '100' || opt.value === '10') {
+              s.value = opt.value;
+              s.dispatchEvent(new Event('change', { bubbles: true }));
+              return;
+            }
+          }
+        }
+      });
       await sleep(3000);
-    } else {
-      console.warn('⚠️ Could not set dropdown, using default page size.');
+    } catch (e) {
+      console.warn('⚠️ Could not set page size:', e.message);
     }
 
-    // ----- Paginate by clicking "Next" until disabled -----
+    // ----- Paginate -----
     let allRows = [];
     let pageNum = 0;
-    let headers = [];
-    let maxPages = 100; // safety
+    let maxPages = 100;
 
     while (pageNum < maxPages) {
       pageNum++;
       console.log(`📄 Scraping page ${pageNum}...`);
 
-      // Get headers from first page
-      if (pageNum === 1) {
-        headers = await page.evaluate(() => {
-          const table = document.querySelector('table');
-          if (!table) return [];
-          const ths = table.querySelectorAll('tr:first-child th, tr:first-child td');
-          return Array.from(ths).map(cell => cell.innerText.trim());
-        });
-        console.log(`🔍 Headers: ${headers.join(' | ')}`);
-        // Check if headers contain required columns
-        const requiredCols = ['Full Name', 'Address', 'Created'];
-        const found = requiredCols.filter(col => headers.some(h => h.includes(col)));
-        if (found.length < requiredCols.length) {
-          console.warn(`⚠️ Table may not have all columns. Found: ${found.join(', ')}. Missing: ${requiredCols.filter(c => !found.includes(c)).join(', ')}`);
-          // Continue anyway – we'll use fallback indices
-        }
-      }
-
-      // Extract data rows
-      const rows = await page.evaluate(() => {
-        const table = document.querySelector('table');
-        if (!table) return [];
-        const trs = table.querySelectorAll('tr');
-        const dataRows = [];
-        for (let i = 1; i < trs.length; i++) {
-          const tds = trs[i].querySelectorAll('th, td');
-          const rowData = Array.from(tds).map(cell => cell.innerText.trim());
-          if (rowData.length > 0) dataRows.push(rowData);
-        }
-        return dataRows;
-      });
-
+      // Get data from the correct table
+      const rows = await getTableData();
       console.log(`   → Found ${rows.length} rows on page ${pageNum}`);
       allRows = allRows.concat(rows);
 
-      // Try to click "Next"
-      const nextButton = await page.evaluate(() => {
+      // Check if Next button exists and is not disabled
+      const nextInfo = await page.evaluate(() => {
         const links = document.querySelectorAll('a, button');
         for (const el of links) {
           const text = (el.innerText || '').toLowerCase();
           const cls = el.className || '';
           if ((text.includes('next') || text.includes('>') || cls.includes('next')) && !el.disabled) {
-            if (el.getAttribute('aria-disabled') === 'true') return null;
-            return el;
+            const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled');
+            return { exists: true, disabled: !!disabled };
           }
         }
-        return null;
+        return { exists: false, disabled: true };
       });
 
-      if (!nextButton) {
+      if (!nextInfo.exists) {
         console.log('✅ No more pages (Next button not found).');
         break;
       }
-
-      // Check if button is disabled (via attribute or style)
-      const isDisabled = await page.evaluate(el => {
-        return el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled');
-      }, nextButton);
-
-      if (isDisabled) {
+      if (nextInfo.disabled) {
         console.log('✅ No more pages (Next button disabled).');
         break;
       }
 
-      // Click and wait for navigation or table update
-      await Promise.all([
-        nextButton.click(),
-        page.waitForSelector('table', { timeout: 30000 }),
-        page.waitForFunction(
-          (prevRows) => document.querySelectorAll('table tr').length > prevRows,
-          { timeout: 15000, args: [rows.length + 1] } // +1 for header
-        ).catch(() => console.warn('Row count did not increase, but continuing...'))
-      ]);
+      // Click Next
+      await page.evaluate(() => {
+        const links = document.querySelectorAll('a, button');
+        for (const el of links) {
+          const text = (el.innerText || '').toLowerCase();
+          const cls = el.className || '';
+          if ((text.includes('next') || text.includes('>') || cls.includes('next')) && !el.disabled) {
+            el.click();
+            return;
+          }
+        }
+      });
+
+      console.log(`⏩ Clicked "Next" – loading page ${pageNum + 1}...`);
+      await page.waitForSelector('table', { timeout: 30000 });
       await sleep(2000);
     }
 
@@ -341,37 +381,35 @@ async function syncCRM() {
     console.log(`📥 Scraped total of ${allRows.length} data rows.`);
     if (allRows.length === 0) throw new Error('No data rows found.');
 
-    // ----- Map columns (using headers) -----
-    let idIdx, nameIdx, phoneIdx, addressIdx, pkgIdx, expiryIdx, createdIdx;
-    if (headers.length > 0) {
-      function findIndex(keywords) {
-        for (const kw of keywords) {
-          const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
-          if (idx !== -1) return idx;
-        }
-        return -1;
+    // ----- Map columns using headers -----
+    function findIndex(keywords) {
+      for (const kw of keywords) {
+        const idx = headers.findIndex(h => h.toLowerCase().includes(kw.toLowerCase()));
+        if (idx !== -1) return idx;
       }
-      idIdx = findIndex(['username', 'user id', 'id']);
-      nameIdx = findIndex(['full name', 'fullname', 'name']);
-      phoneIdx = findIndex(['phone', 'mobile', 'contact']);
-      addressIdx = findIndex(['address', 'location']);
-      pkgIdx = findIndex(['package', 'plan', 'bandwidth']);
-      expiryIdx = findIndex(['expiry', 'expiration', 'expirydate', 'validuntil']);
-      createdIdx = findIndex(['created', 'creationdate', 'createddate', 'activationdate']);
-      console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Expiry=${expiryIdx}, Created=${createdIdx}`);
+      return -1;
     }
 
-    // Fallback defaults (based on CSV order, but table may differ)
-    const defaultIndices = { id: 3, name: 4, phone: 6, address: 7, pkg: 8, expiry: 15, created: 22 };
-    const finalId = idIdx !== undefined && idIdx !== -1 ? idIdx : defaultIndices.id;
-    const finalName = nameIdx !== undefined && nameIdx !== -1 ? nameIdx : defaultIndices.name;
-    const finalPhone = phoneIdx !== undefined && phoneIdx !== -1 ? phoneIdx : defaultIndices.phone;
-    const finalAddress = addressIdx !== undefined && addressIdx !== -1 ? addressIdx : defaultIndices.address;
-    const finalPkg = pkgIdx !== undefined && pkgIdx !== -1 ? pkgIdx : defaultIndices.pkg;
-    const finalExpiry = expiryIdx !== undefined && expiryIdx !== -1 ? expiryIdx : defaultIndices.expiry;
-    const finalCreated = createdIdx !== undefined && createdIdx !== -1 ? createdIdx : defaultIndices.created;
+    const idIdx = findIndex(['username', 'user id', 'id']);
+    const nameIdx = findIndex(['full name', 'fullname', 'name']);
+    const phoneIdx = findIndex(['phone', 'mobile', 'contact']);
+    const addressIdx = findIndex(['address', 'location']);
+    const pkgIdx = findIndex(['package', 'plan', 'bandwidth']);
+    const expiryIdx = findIndex(['expiry', 'expiration', 'expirydate', 'validuntil']);
+    const createdIdx = findIndex(['created', 'creationdate', 'createddate', 'activationdate']);
 
-    // ----- Build records -----
+    console.log(`Mapped indices: ID=${idIdx}, Name=${nameIdx}, Phone=${phoneIdx}, Address=${addressIdx}, Package=${pkgIdx}, Expiry=${expiryIdx}, Created=${createdIdx}`);
+
+    // Fallback defaults (if any index is -1)
+    const defaultIndices = { id: 3, name: 4, phone: 6, address: 7, pkg: 8, expiry: 15, created: 22 };
+    const finalId = idIdx !== -1 ? idIdx : defaultIndices.id;
+    const finalName = nameIdx !== -1 ? nameIdx : defaultIndices.name;
+    const finalPhone = phoneIdx !== -1 ? phoneIdx : defaultIndices.phone;
+    const finalAddress = addressIdx !== -1 ? addressIdx : defaultIndices.address;
+    const finalPkg = pkgIdx !== -1 ? pkgIdx : defaultIndices.pkg;
+    const finalExpiry = expiryIdx !== -1 ? expiryIdx : defaultIndices.expiry;
+    const finalCreated = createdIdx !== -1 ? createdIdx : defaultIndices.created;
+
     const records = allRows.map(row => {
       const id = stripHtml(row[finalId] || '');
       const name = stripHtml(row[finalName] || '');
