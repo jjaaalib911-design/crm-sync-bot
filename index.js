@@ -200,7 +200,7 @@ function calculateActiveDateFromExpiry(expiryDate) {
 
   const activeDate = new Date(expiryDate);
 
-  activeDate.setDate(activeDate.getDate() - 30);
+  activeDate.setDate(activeDate.getDate() - 29);
 
   return activeDate;
 }
