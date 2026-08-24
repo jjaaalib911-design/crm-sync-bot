@@ -209,7 +209,7 @@ function calculateActiveDate(expiryDate) {
     new Date(expiryDate);
 
   activeDate.setDate(
-    activeDate.getDate() - 30
+    activeDate.getDate() - 31
   );
 
   return activeDate;
