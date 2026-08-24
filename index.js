@@ -47,7 +47,10 @@ try {
   process.exit(1);
 }
 
-const sheets = google.sheets({ version: 'v4', auth });
+const sheets = google.sheets({
+  version: 'v4',
+  auth
+});
 
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
@@ -74,6 +77,7 @@ const PACKAGE_PRICES = {
   '15 MB Day': 2000,
   'default': 0,
 };
+
 
 function getPriceForPackage(pkg) {
   if (!pkg) return PACKAGE_PRICES.default || 0;
@@ -172,13 +176,14 @@ function parseCrmDate(text) {
 
 
 // ====================================================
-// FORMAT DATE FOR SHEET
+// FORMAT DATE FOR GOOGLE SHEETS
 // ====================================================
 
 function formatDateForSheet(date) {
   if (!date) return '';
 
   const y = date.getFullYear();
+
   const m = String(
     date.getMonth() + 1
   ).padStart(2, '0');
@@ -197,7 +202,7 @@ function formatDateForSheet(date) {
 // Active Date = Expiry Date - 30 Days
 // ====================================================
 
-function calculateActiveDateFromExpiry(expiryDate) {
+function calculateActiveDate(expiryDate) {
   if (!expiryDate) return null;
 
   const activeDate =
@@ -212,26 +217,21 @@ function calculateActiveDateFromExpiry(expiryDate) {
 
 
 // ====================================================
-// CALCULATE DAYS BETWEEN ACTIVE AND EXPIRY
+// CALCULATE DAYS REMAINING
 //
-// Days Remaining = Expiry Date - Active Date
+// Days Remaining = Expiry Date - TODAY
 //
 // Example:
-// Active  = 03-Aug-2026
-// Expiry  = 02-Sep-2026
-// Result  = 30
+// Today  = 24-Aug-2026
+// Expiry = 02-Sep-2026
+// Result = 9
 // ====================================================
 
-function calculateDaysRemaining(
-  activeDate,
-  expiryDate
-) {
-  if (!activeDate || !expiryDate) {
-    return '';
-  }
+function calculateDaysRemaining(expiryDate, today) {
+  if (!expiryDate) return '';
 
   const diffMs =
-    expiryDate - activeDate;
+    expiryDate - today;
 
   return Math.round(
     diffMs /
@@ -241,20 +241,14 @@ function calculateDaysRemaining(
 
 
 // ====================================================
-// STATUS CALCULATION
+// CALCULATE STATUS
 //
-// Status is based on REAL CRM expiry date
-// compared with TODAY.
-//
-// Expired       = expiry before today
-// Expiring Soon = 0 to 3 days remaining
-// Active        = more than 3 days remaining
+// Expired       = less than 0 days
+// Expiring Soon = 0 to 3 days
+// Active        = more than 3 days
 // ====================================================
 
-function computeStatus(
-  expiryDate,
-  today
-) {
+function computeStatus(expiryDate, today) {
   if (!expiryDate) {
     return {
       status: '',
@@ -263,9 +257,9 @@ function computeStatus(
   }
 
   const diffDays =
-    Math.round(
-      (expiryDate - today) /
-      (1000 * 60 * 60 * 24)
+    calculateDaysRemaining(
+      expiryDate,
+      today
     );
 
   let status;
@@ -290,7 +284,7 @@ function computeStatus(
 // ====================================================
 // EXTRACT CRM RECORD
 //
-// CRM field positions:
+// Confirmed CRM field positions:
 //
 // 2  = Username / ID
 // 3  = Name
@@ -299,7 +293,8 @@ function computeStatus(
 // 7  = Package
 // 14 = Expiry Date
 //
-// row[21] is no longer used for Activation Date.
+// row[21] is no longer used.
+// Active Date is calculated from Expiry Date.
 // ====================================================
 
 function extractRecord(row) {
@@ -318,7 +313,6 @@ function extractRecord(row) {
   const pkg =
     stripHtml(row[7]);
 
-  // Expiry Date directly from CRM
   const expiryDate =
     parseCrmDate(row[14]);
 
@@ -337,21 +331,16 @@ function extractRecord(row) {
 // BUILD REQUEST BODY
 // ====================================================
 
-function buildRequestBody(
-  start,
-  length,
-  filterType
-) {
-  const orderableColumns =
-    new Set([
-      0,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7
-    ]);
+function buildRequestBody(start, length, filterType) {
+  const orderableColumns = new Set([
+    0,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ]);
 
   const params =
     new URLSearchParams();
@@ -440,13 +429,10 @@ function buildRequestBody(
 
 
 // ====================================================
-// CALL DATA API
+// CALL CRM DATA API
 // ====================================================
 
-async function callDataApi(
-  page,
-  body
-) {
+async function callDataApi(page, body) {
   return await page.evaluate(
     async (url, b) => {
 
@@ -607,7 +593,8 @@ async function overwriteSheet(records) {
 
 
         // ----------------------------------------------
-        // EXPIRY DATE FROM CRM
+        // EXPIRY DATE
+        // From CRM
         // ----------------------------------------------
 
         const expiryDateStr =
@@ -619,11 +606,11 @@ async function overwriteSheet(records) {
         // ----------------------------------------------
         // ACTIVE DATE
         //
-        // Expiry Date - 30 days
+        // Expiry Date - 30 Days
         // ----------------------------------------------
 
         const activeDate =
-          calculateActiveDateFromExpiry(
+          calculateActiveDate(
             rec.expiryDate
           );
 
@@ -647,33 +634,18 @@ async function overwriteSheet(records) {
 
 
         // ----------------------------------------------
-        // STATUS
+        // STATUS + DAYS REMAINING
         //
-        // Status still uses today's date vs expiry.
+        // Days Remaining = Expiry - Today
         // ----------------------------------------------
 
         const {
-          status
+          status,
+          daysRemaining
         } =
           computeStatus(
             rec.expiryDate,
             today
-          );
-
-
-        // ----------------------------------------------
-        // DAYS REMAINING
-        //
-        // Expiry Date - Active Date
-        //
-        // Example:
-        // 03-Aug-2026 → 02-Sep-2026 = 30
-        // ----------------------------------------------
-
-        const daysRemaining =
-          calculateDaysRemaining(
-            activeDate,
-            rec.expiryDate
           );
 
 
@@ -694,7 +666,6 @@ async function overwriteSheet(records) {
           expiryDateStr,      // Expiry Date
 
           status,             // Status
-
           daysRemaining,      // Days Remaining
 
           ''                  // Last Notified
@@ -707,7 +678,7 @@ async function overwriteSheet(records) {
 
 
   // ==================================================
-  // HEADERS + DATA
+  // HEADERS + ROWS
   // ==================================================
 
   const allData = [
@@ -760,7 +731,7 @@ async function syncCRM() {
   try {
 
     // =================================================
-    // LAUNCH PUPPETEER
+    // LAUNCH BROWSER
     // =================================================
 
     browser =
@@ -769,7 +740,7 @@ async function syncCRM() {
 
         args: [
           '--no-sandbox',
-          '--disable-setuid-sandbox'
+          '--disable-setuid-sandbox',
         ],
       });
 
@@ -829,7 +800,7 @@ async function syncCRM() {
       page.waitForNavigation({
         waitUntil: 'networkidle2',
         timeout: 30000
-      })
+      }),
 
     ]);
 
@@ -840,7 +811,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // CUSTOMER LIST PAGE
+    // OPEN CUSTOMER LIST
     // =================================================
 
     console.log(
@@ -878,7 +849,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // FETCH ALL RECORDS
+    // FETCH ALL CUSTOMERS
     // =================================================
 
     const total =
@@ -923,7 +894,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // DEBUG FIRST RECORD
+    // DEBUG RAW FIRST RECORD
     // =================================================
 
     console.log(
@@ -988,12 +959,11 @@ console.log(
   'CRM Sync Bot starting...'
 );
 
-
 syncCRM();
 
 
 // ====================================================
-// SYNC EVERY 5 MINUTES
+// RUN EVERY 5 MINUTES
 // ====================================================
 
 setInterval(
