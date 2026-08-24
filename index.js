@@ -50,6 +50,11 @@ const PACKAGE_PRICES = {
   '10MB': 2300,
   '30 MB Day': 2500,
   '50 MB': 8500,
+  '20+10Mbps': 3000,
+  '30 MB EID': 4000,
+  '10+10Mbps': 2500,
+  '14+10Mbps': 2500,
+  '15 MB Day': 2000,
   'default': 0,
 };
 function getPriceForPackage(pkg) {
