@@ -42,7 +42,6 @@ try {
     credentials: creds,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-
 } catch (e) {
   console.error('Failed to parse GOOGLE_CREDENTIALS:', e.message);
   process.exit(1);
@@ -76,7 +75,6 @@ const PACKAGE_PRICES = {
   'default': 0,
 };
 
-
 function getPriceForPackage(pkg) {
   if (!pkg) return PACKAGE_PRICES.default || 0;
 
@@ -97,7 +95,7 @@ function getPriceForPackage(pkg) {
 
 
 // ====================================================
-// HTML CLEANING
+// STRIP HTML
 // ====================================================
 
 function stripHtml(str) {
@@ -131,18 +129,21 @@ const MONTHS = {
 
 
 // ====================================================
-// CRM DATE PARSER
+// PARSE CRM DATE
 // ====================================================
 
 function parseCrmDate(text) {
   const clean = stripHtml(text);
 
-  const match = clean.match(/(\d{1,2})\s+(\w{3})\w*\s+(\d{4})/);
+  const match = clean.match(
+    /(\d{1,2})\s+(\w{3})\w*\s+(\d{4})/
+  );
 
   if (match) {
     const [, day, monAbbr, year] = match;
 
-    const month = MONTHS[monAbbr.slice(0, 3)];
+    const month =
+      MONTHS[monAbbr.slice(0, 3)];
 
     if (month !== undefined) {
       return new Date(
@@ -153,7 +154,8 @@ function parseCrmDate(text) {
     }
   }
 
-  const isoLike = clean.match(/(\d{4})-(\d{2})-(\d{2})/);
+  const isoLike =
+    clean.match(/(\d{4})-(\d{2})-(\d{2})/);
 
   if (isoLike) {
     const [, y, m, d] = isoLike;
@@ -170,53 +172,89 @@ function parseCrmDate(text) {
 
 
 // ====================================================
-// FORMAT DATE FOR GOOGLE SHEETS
+// FORMAT DATE FOR SHEET
 // ====================================================
 
 function formatDateForSheet(date) {
   if (!date) return '';
 
   const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
+  const m = String(
+    date.getMonth() + 1
+  ).padStart(2, '0');
+
+  const d = String(
+    date.getDate()
+  ).padStart(2, '0');
 
   return `${y}-${m}-${d}`;
 }
 
 
 // ====================================================
-// CALCULATE PAYMENT / ACTIVATION DATE
+// CALCULATE ACTIVE DATE
 //
-// NEW LOGIC:
-//
-// Payment Date = Expiry Date - 30 Days
-// Activation Date = Expiry Date - 30 Days
-//
-// Both dates are therefore identical.
+// Active Date = Expiry Date - 30 Days
 // ====================================================
 
 function calculateActiveDateFromExpiry(expiryDate) {
   if (!expiryDate) return null;
 
-  const activeDate = new Date(expiryDate);
+  const activeDate =
+    new Date(expiryDate);
 
-  activeDate.setDate(activeDate.getDate() - 30);
+  activeDate.setDate(
+    activeDate.getDate() - 30
+  );
 
   return activeDate;
 }
 
 
 // ====================================================
+// CALCULATE DAYS BETWEEN ACTIVE AND EXPIRY
+//
+// Days Remaining = Expiry Date - Active Date
+//
+// Example:
+// Active  = 03-Aug-2026
+// Expiry  = 02-Sep-2026
+// Result  = 30
+// ====================================================
+
+function calculateDaysRemaining(
+  activeDate,
+  expiryDate
+) {
+  if (!activeDate || !expiryDate) {
+    return '';
+  }
+
+  const diffMs =
+    expiryDate - activeDate;
+
+  return Math.round(
+    diffMs /
+    (1000 * 60 * 60 * 24)
+  );
+}
+
+
+// ====================================================
 // STATUS CALCULATION
 //
-// Status is still based on the REAL CRM EXPIRY DATE.
+// Status is based on REAL CRM expiry date
+// compared with TODAY.
 //
-// Expired       = Expiry Date is before today
+// Expired       = expiry before today
 // Expiring Soon = 0 to 3 days remaining
 // Active        = more than 3 days remaining
 // ====================================================
 
-function computeStatus(expiryDate, today) {
+function computeStatus(
+  expiryDate,
+  today
+) {
   if (!expiryDate) {
     return {
       status: '',
@@ -224,16 +262,19 @@ function computeStatus(expiryDate, today) {
     };
   }
 
-  const diffDays = Math.round(
-    (expiryDate - today) /
-    (1000 * 60 * 60 * 24)
-  );
+  const diffDays =
+    Math.round(
+      (expiryDate - today) /
+      (1000 * 60 * 60 * 24)
+    );
 
   let status;
 
   if (diffDays < 0) {
     status = 'Expired';
-  } else if (diffDays <= REMINDER_WINDOW_DAYS) {
+  } else if (
+    diffDays <= REMINDER_WINDOW_DAYS
+  ) {
     status = 'Expiring Soon';
   } else {
     status = 'Active';
@@ -258,22 +299,28 @@ function computeStatus(expiryDate, today) {
 // 7  = Package
 // 14 = Expiry Date
 //
-// IMPORTANT:
-// row[21] is NO LONGER USED for Activation Date.
-//
-// Activation Date and Payment Date are now calculated
-// from Expiry Date - 30 days.
+// row[21] is no longer used for Activation Date.
 // ====================================================
 
 function extractRecord(row) {
-  const username = stripHtml(row[2]);
-  const name = stripHtml(row[3]);
-  const phone = stripHtml(row[5]);
-  const address = stripHtml(row[6]);
-  const pkg = stripHtml(row[7]);
+  const username =
+    stripHtml(row[2]);
 
-  // Get real expiry date directly from CRM
-  const expiryDate = parseCrmDate(row[14]);
+  const name =
+    stripHtml(row[3]);
+
+  const phone =
+    stripHtml(row[5]);
+
+  const address =
+    stripHtml(row[6]);
+
+  const pkg =
+    stripHtml(row[7]);
+
+  // Expiry Date directly from CRM
+  const expiryDate =
+    parseCrmDate(row[14]);
 
   return {
     username,
@@ -287,23 +334,32 @@ function extractRecord(row) {
 
 
 // ====================================================
-// BUILD CRM API REQUEST BODY
+// BUILD REQUEST BODY
 // ====================================================
 
-function buildRequestBody(start, length, filterType) {
-  const orderableColumns = new Set([
-    0,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7
-  ]);
+function buildRequestBody(
+  start,
+  length,
+  filterType
+) {
+  const orderableColumns =
+    new Set([
+      0,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]);
 
-  const params = new URLSearchParams();
+  const params =
+    new URLSearchParams();
 
-  params.append('draw', '1');
+  params.append(
+    'draw',
+    '1'
+  );
 
   for (let i = 0; i <= 22; i++) {
     params.append(
@@ -323,7 +379,9 @@ function buildRequestBody(start, length, filterType) {
 
     params.append(
       `columns[${i}][orderable]`,
-      orderableColumns.has(i) ? 'true' : 'false'
+      orderableColumns.has(i)
+        ? 'true'
+        : 'false'
     );
 
     params.append(
@@ -382,26 +440,30 @@ function buildRequestBody(start, length, filterType) {
 
 
 // ====================================================
-// CALL CRM DATA API
+// CALL DATA API
 // ====================================================
 
-async function callDataApi(page, body) {
+async function callDataApi(
+  page,
+  body
+) {
   return await page.evaluate(
     async (url, b) => {
 
-      const res = await fetch(url, {
-        method: 'POST',
+      const res =
+        await fetch(url, {
+          method: 'POST',
 
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded; charset=UTF-8',
+          headers: {
+            'Content-Type':
+              'application/x-www-form-urlencoded; charset=UTF-8',
 
-          'X-Requested-With':
-            'XMLHttpRequest',
-        },
+            'X-Requested-With':
+              'XMLHttpRequest',
+          },
 
-        body: b,
-      });
+          body: b,
+        });
 
       return res.json();
 
@@ -437,16 +499,18 @@ async function findBestFilterType(page) {
 
     try {
 
-      const body = buildRequestBody(
-        0,
-        1,
-        ft
-      );
+      const body =
+        buildRequestBody(
+          0,
+          1,
+          ft
+        );
 
-      const result = await callDataApi(
-        page,
-        body
-      );
+      const result =
+        await callDataApi(
+          page,
+          body
+        );
 
       const filtered =
         result.recordsFiltered || 0;
@@ -458,8 +522,10 @@ async function findBestFilterType(page) {
         `  filterType=${JSON.stringify(ft)} -> recordsFiltered=${filtered}, recordsTotal=${total}`
       );
 
-      if (filtered > best.recordsFiltered) {
-
+      if (
+        filtered >
+        best.recordsFiltered
+      ) {
         best = {
           filterType: ft,
           recordsFiltered: filtered,
@@ -481,7 +547,7 @@ async function findBestFilterType(page) {
 
 
 // ====================================================
-// OVERWRITE GOOGLE SHEET
+// OVERWRITE SHEET
 // ====================================================
 
 async function overwriteSheet(records) {
@@ -506,7 +572,8 @@ async function overwriteSheet(records) {
   // TODAY
   // ==================================================
 
-  const today = new Date();
+  const today =
+    new Date();
 
   today.setHours(
     0,
@@ -520,104 +587,127 @@ async function overwriteSheet(records) {
   // BUILD ROWS
   // ==================================================
 
-  const rows = records
-    .map(rec => {
+  const rows =
+    records
+      .map(rec => {
 
-      if (!rec.phone) {
-        return null;
-      }
-
-
-      // ----------------------------------------------
-      // PACKAGE PRICE
-      // ----------------------------------------------
-
-      const price =
-        getPriceForPackage(rec.pkg);
+        if (!rec.phone) {
+          return null;
+        }
 
 
-      // ----------------------------------------------
-      // REAL EXPIRY DATE FROM CRM
-      // ----------------------------------------------
+        // ----------------------------------------------
+        // PACKAGE PRICE
+        // ----------------------------------------------
 
-      const expiryDateStr =
-        formatDateForSheet(
-          rec.expiryDate
-        );
-
-
-      // ----------------------------------------------
-      // NEW LOGIC
-      //
-      // Activation Date = Expiry Date - 30 days
-      // Payment Date    = Expiry Date - 30 days
-      //
-      // Both are exactly the same date.
-      // ----------------------------------------------
-
-      const activeDate =
-        calculateActiveDateFromExpiry(
-          rec.expiryDate
-        );
-
-      const activationDateStr =
-        formatDateForSheet(
-          activeDate
-        );
-
-      const paymentDateStr =
-        formatDateForSheet(
-          activeDate
-        );
+        const price =
+          getPriceForPackage(
+            rec.pkg
+          );
 
 
-      // ----------------------------------------------
-      // STATUS
-      //
-      // Still calculated from REAL expiry date.
-      // ----------------------------------------------
+        // ----------------------------------------------
+        // EXPIRY DATE FROM CRM
+        // ----------------------------------------------
 
-      const {
-        status,
-        daysRemaining
-      } = computeStatus(
-        rec.expiryDate,
-        today
+        const expiryDateStr =
+          formatDateForSheet(
+            rec.expiryDate
+          );
+
+
+        // ----------------------------------------------
+        // ACTIVE DATE
+        //
+        // Expiry Date - 30 days
+        // ----------------------------------------------
+
+        const activeDate =
+          calculateActiveDateFromExpiry(
+            rec.expiryDate
+          );
+
+
+        const activationDateStr =
+          formatDateForSheet(
+            activeDate
+          );
+
+
+        // ----------------------------------------------
+        // PAYMENT DATE
+        //
+        // Payment Date = Active Date
+        // ----------------------------------------------
+
+        const paymentDateStr =
+          formatDateForSheet(
+            activeDate
+          );
+
+
+        // ----------------------------------------------
+        // STATUS
+        //
+        // Status still uses today's date vs expiry.
+        // ----------------------------------------------
+
+        const {
+          status
+        } =
+          computeStatus(
+            rec.expiryDate,
+            today
+          );
+
+
+        // ----------------------------------------------
+        // DAYS REMAINING
+        //
+        // Expiry Date - Active Date
+        //
+        // Example:
+        // 03-Aug-2026 → 02-Sep-2026 = 30
+        // ----------------------------------------------
+
+        const daysRemaining =
+          calculateDaysRemaining(
+            activeDate,
+            rec.expiryDate
+          );
+
+
+        // ----------------------------------------------
+        // FINAL ROW
+        // ----------------------------------------------
+
+        return [
+          rec.username,       // ID No.
+          rec.name,           // Name
+          rec.phone,          // Phone
+          rec.address,        // Address
+          rec.pkg,            // Package
+          price,              // Amount Paid
+
+          paymentDateStr,     // Payment Date
+          activationDateStr,  // Activation Date
+          expiryDateStr,      // Expiry Date
+
+          status,             // Status
+
+          daysRemaining,      // Days Remaining
+
+          ''                  // Last Notified
+        ];
+
+      })
+      .filter(
+        row => row !== null
       );
 
 
-      // ----------------------------------------------
-      // FINAL SHEET ROW
-      // ----------------------------------------------
-
-      return [
-        rec.username,       // ID No.
-        rec.name,           // Name
-        rec.phone,          // Phone
-        rec.address,        // Address
-        rec.pkg,            // Package
-        price,              // Amount Paid
-
-        paymentDateStr,     // Payment Date
-                            // Expiry Date - 30 days
-
-        activationDateStr,  // Activation Date
-                            // Expiry Date - 30 days
-
-        expiryDateStr,      // Expiry Date
-                            // From CRM
-
-        status,             // Status
-        daysRemaining,      // Days Remaining
-        ''                  // Last Notified
-      ];
-
-    })
-    .filter(row => row !== null);
-
-
   // ==================================================
-  // COMBINE HEADERS + DATA
+  // HEADERS + DATA
   // ==================================================
 
   const allData = [
@@ -627,7 +717,7 @@ async function overwriteSheet(records) {
 
 
   // ==================================================
-  // WRITE DATA TO CUSTOMERS SHEET
+  // WRITE TO GOOGLE SHEET
   // ==================================================
 
   await sheets.spreadsheets.values.update({
@@ -655,7 +745,7 @@ async function overwriteSheet(records) {
 
 
 // ====================================================
-// MAIN CRM SYNC
+// MAIN SYNC
 // ====================================================
 
 async function syncCRM() {
@@ -670,19 +760,18 @@ async function syncCRM() {
   try {
 
     // =================================================
-    // LAUNCH BROWSER
+    // LAUNCH PUPPETEER
     // =================================================
 
-    browser = await puppeteer.launch({
+    browser =
+      await puppeteer.launch({
+        headless: true,
 
-      headless: true,
-
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
-      ]
-
-    });
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox'
+        ],
+      });
 
 
     const page =
@@ -751,7 +840,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // OPEN CUSTOMER LIST
+    // CUSTOMER LIST PAGE
     // =================================================
 
     console.log(
@@ -778,7 +867,9 @@ async function syncCRM() {
 
 
     const best =
-      await findBestFilterType(page);
+      await findBestFilterType(
+        page
+      );
 
 
     console.log(
@@ -787,7 +878,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // FETCH ALL CUSTOMERS
+    // FETCH ALL RECORDS
     // =================================================
 
     const total =
@@ -822,17 +913,17 @@ async function syncCRM() {
     );
 
 
-    if (rawRows.length === 0) {
-
+    if (
+      rawRows.length === 0
+    ) {
       throw new Error(
         'No records returned even after testing filter types.'
       );
-
     }
 
 
     // =================================================
-    // DEBUG RAW FIRST RECORD
+    // DEBUG FIRST RECORD
     // =================================================
 
     console.log(
@@ -841,12 +932,14 @@ async function syncCRM() {
 
 
     console.log(
-      JSON.stringify(rawRows[0])
+      JSON.stringify(
+        rawRows[0]
+      )
     );
 
 
     // =================================================
-    // CONVERT CRM ROWS TO RECORDS
+    // EXTRACT RECORDS
     // =================================================
 
     const records =
@@ -856,7 +949,7 @@ async function syncCRM() {
 
 
     // =================================================
-    // OVERWRITE GOOGLE SHEET
+    // OVERWRITE SHEET
     // =================================================
 
     await overwriteSheet(
@@ -900,7 +993,7 @@ syncCRM();
 
 
 // ====================================================
-// RUN EVERY 5 MINUTES
+// SYNC EVERY 5 MINUTES
 // ====================================================
 
 setInterval(
