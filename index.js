@@ -1,5 +1,5 @@
 // ====================================================
-// index.js — CRM Live Data Sync (overwrites sheet every 5 min)
+// index.js — CRM Live Data Sync (overwrites sheet every 30 min)
 // Deploy on Railway
 // ====================================================
 
@@ -54,6 +54,29 @@ const sheets = google.sheets({
 
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
+
+// ====================================================
+// SYNC SCHEDULE
+//
+// Every 30 minutes -> 48 runs per day.
+// (Previously every 5 minutes -> 288 runs/day, which was
+// the main thing eating Railway's monthly usage allowance
+// and also made overlapping/parallel browser launches more
+// likely, which was contributing to the crash.)
+// ====================================================
+
+const SYNC_INTERVAL_MS = 30 * 60 * 1000;
+
+// How long a single sync is allowed to run before we give up
+// on it and let the next scheduled tick try again with a
+// fresh browser instance, instead of hanging forever.
+const SYNC_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+
+// Guards against a run being kicked off while a previous run
+// (browser launch, login, scraping) is still in progress.
+// Overlapping browser launches was one of the causes of the
+// "Resource temporarily unavailable" crash.
+let isSyncing = false;
 
 
 // ====================================================
@@ -716,10 +739,88 @@ async function overwriteSheet(records) {
 
 
 // ====================================================
+// LAUNCH BROWSER (hardened against the EAGAIN / fork
+// crash seen in production)
+//
+// Key flags:
+//  --disable-dev-shm-usage   -> avoids Chrome using /dev/shm,
+//                               which is tiny/absent in most
+//                               containers and is a very common
+//                               source of crashes under load.
+//  --disable-crash-reporter,
+//  --disable-breakpad        -> skips spawning the crashpad
+//                               helper process entirely, which
+//                               is the exact subprocess that was
+//                               failing to fork with EAGAIN.
+//  --no-zygote                -> skips the zygote helper process,
+//                               reducing how many child processes
+//                               Chrome tries to fork on launch.
+//  --disable-gpu,
+//  --disable-software-rasterizer,
+//  --disable-extensions,
+//  --disable-background-networking,
+//  --no-first-run             -> trims extra Chrome subsystems
+//                               that aren't needed for headless
+//                               scraping, further reducing memory
+//                               and process-count pressure.
+// ====================================================
+
+async function launchBrowser() {
+  return puppeteer.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-crash-reporter',
+      '--disable-breakpad',
+      '--no-zygote',
+      '--no-first-run',
+    ],
+  });
+}
+
+
+// ====================================================
+// RUN WITH TIMEOUT
+//
+// Prevents a single sync from hanging forever (e.g. a CRM
+// page that never fires "networkidle2") and blocking every
+// future scheduled run behind it.
+// ====================================================
+
+function withTimeout(promise, ms, label) {
+  let timer;
+
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+
+// ====================================================
 // MAIN SYNC
 // ====================================================
 
 async function syncCRM() {
+
+  if (isSyncing) {
+    console.log(
+      `[${new Date().toISOString()}] Previous sync still running — skipping this tick.`
+    );
+    return;
+  }
+
+  isSyncing = true;
 
   console.log(
     `[${new Date().toISOString()}] Sync started...`
@@ -730,206 +831,206 @@ async function syncCRM() {
 
   try {
 
-    // =================================================
-    // LAUNCH BROWSER
-    // =================================================
+    await withTimeout(
+      (async () => {
 
-    browser =
-      await puppeteer.launch({
-        headless: true,
+        // =================================================
+        // LAUNCH BROWSER
+        // =================================================
 
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-        ],
-      });
+        browser = await launchBrowser();
 
 
-    const page =
-      await browser.newPage();
+        const page =
+          await browser.newPage();
 
 
-    await page.setViewport({
-      width: 1280,
-      height: 800
-    });
+        await page.setViewport({
+          width: 1280,
+          height: 800
+        });
 
 
-    // =================================================
-    // LOGIN
-    // =================================================
+        // =================================================
+        // LOGIN
+        // =================================================
 
-    console.log(
-      'Logging in...'
-    );
-
-
-    await page.goto(
-      CRM_LOGIN_URL,
-      {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      }
-    );
+        console.log(
+          'Logging in...'
+        );
 
 
-    await page.type(
-      'input[name="username"]',
-      CRM_USERNAME,
-      {
-        delay: 30
-      }
-    );
+        await page.goto(
+          CRM_LOGIN_URL,
+          {
+            waitUntil: 'networkidle2',
+            timeout: 30000
+          }
+        );
 
 
-    await page.type(
-      'input[name="password"]',
-      CRM_PASSWORD,
-      {
-        delay: 30
-      }
-    );
+        await page.type(
+          'input[name="username"]',
+          CRM_USERNAME,
+          {
+            delay: 30
+          }
+        );
 
 
-    await Promise.all([
-
-      page.click(
-        'button[type="submit"]'
-      ),
-
-      page.waitForNavigation({
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      }),
-
-    ]);
+        await page.type(
+          'input[name="password"]',
+          CRM_PASSWORD,
+          {
+            delay: 30
+          }
+        );
 
 
-    console.log(
-      'Login successful.'
-    );
+        await Promise.all([
+
+          page.click(
+            'button[type="submit"]'
+          ),
+
+          page.waitForNavigation({
+            waitUntil: 'networkidle2',
+            timeout: 30000
+          }),
+
+        ]);
 
 
-    // =================================================
-    // OPEN CUSTOMER LIST
-    // =================================================
-
-    console.log(
-      'Opening customer list page...'
-    );
+        console.log(
+          'Login successful.'
+        );
 
 
-    await page.goto(
-      CRM_LIST_PAGE_URL,
-      {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      }
-    );
+        // =================================================
+        // OPEN CUSTOMER LIST
+        // =================================================
+
+        console.log(
+          'Opening customer list page...'
+        );
 
 
-    // =================================================
-    // FIND BEST FILTER
-    // =================================================
-
-    console.log(
-      'Testing filter settings to find the one showing ALL customers...'
-    );
-
-
-    const best =
-      await findBestFilterType(
-        page
-      );
+        await page.goto(
+          CRM_LIST_PAGE_URL,
+          {
+            waitUntil: 'networkidle2',
+            timeout: 30000
+          }
+        );
 
 
-    console.log(
-      `Best filterType found: ${JSON.stringify(best.filterType)} with ${best.recordsFiltered} of ${best.recordsTotal} total customers.`
-    );
+        // =================================================
+        // FIND BEST FILTER
+        // =================================================
+
+        console.log(
+          'Testing filter settings to find the one showing ALL customers...'
+        );
 
 
-    // =================================================
-    // FETCH ALL CUSTOMERS
-    // =================================================
-
-    const total =
-      Math.max(
-        best.recordsFiltered,
-        best.recordsTotal,
-        1
-      );
+        const best =
+          await findBestFilterType(
+            page
+          );
 
 
-    const fullBody =
-      buildRequestBody(
-        0,
-        total,
-        best.filterType
-      );
+        console.log(
+          `Best filterType found: ${JSON.stringify(best.filterType)} with ${best.recordsFiltered} of ${best.recordsTotal} total customers.`
+        );
 
 
-    const fullResult =
-      await callDataApi(
-        page,
-        fullBody
-      );
+        // =================================================
+        // FETCH ALL CUSTOMERS
+        // =================================================
+
+        const total =
+          Math.max(
+            best.recordsFiltered,
+            best.recordsTotal,
+            1
+          );
 
 
-    const rawRows =
-      fullResult.data || [];
+        const fullBody =
+          buildRequestBody(
+            0,
+            total,
+            best.filterType
+          );
 
 
-    console.log(
-      `Fetched ${rawRows.length} customer records.`
-    );
+        const fullResult =
+          await callDataApi(
+            page,
+            fullBody
+          );
 
 
-    if (
-      rawRows.length === 0
-    ) {
-      throw new Error(
-        'No records returned even after testing filter types.'
-      );
-    }
+        const rawRows =
+          fullResult.data || [];
 
 
-    // =================================================
-    // DEBUG RAW FIRST RECORD
-    // =================================================
-
-    console.log(
-      'RAW first record (for column verification):'
-    );
+        console.log(
+          `Fetched ${rawRows.length} customer records.`
+        );
 
 
-    console.log(
-      JSON.stringify(
-        rawRows[0]
-      )
-    );
+        if (
+          rawRows.length === 0
+        ) {
+          throw new Error(
+            'No records returned even after testing filter types.'
+          );
+        }
 
 
-    // =================================================
-    // EXTRACT RECORDS
-    // =================================================
+        // =================================================
+        // DEBUG RAW FIRST RECORD
+        // =================================================
 
-    const records =
-      rawRows.map(
-        extractRecord
-      );
-
-
-    // =================================================
-    // OVERWRITE SHEET
-    // =================================================
-
-    await overwriteSheet(
-      records
-    );
+        console.log(
+          'RAW first record (for column verification):'
+        );
 
 
-    console.log(
-      `[${new Date().toISOString()}] Sync completed.`
+        console.log(
+          JSON.stringify(
+            rawRows[0]
+          )
+        );
+
+
+        // =================================================
+        // EXTRACT RECORDS
+        // =================================================
+
+        const records =
+          rawRows.map(
+            extractRecord
+          );
+
+
+        // =================================================
+        // OVERWRITE SHEET
+        // =================================================
+
+        await overwriteSheet(
+          records
+        );
+
+
+        console.log(
+          `[${new Date().toISOString()}] Sync completed.`
+        );
+
+      })(),
+      SYNC_TIMEOUT_MS,
+      'Sync'
     );
 
 
@@ -944,11 +1045,40 @@ async function syncCRM() {
   } finally {
 
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+      } catch (closeErr) {
+        console.error('Error while closing browser:', closeErr.message);
+      }
     }
+
+    isSyncing = false;
 
   }
 }
+
+
+// ====================================================
+// PROCESS-LEVEL SAFETY NETS
+//
+// A single unexpected rejection/exception (e.g. Google Sheets
+// API hiccup, CRM page throwing mid-scrape) should never take
+// the whole bot down — just log it and let the next scheduled
+// sync try again.
+// ====================================================
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message);
+});
+
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM — shutting down gracefully.');
+  process.exit(0);
+});
 
 
 // ====================================================
@@ -963,10 +1093,10 @@ syncCRM();
 
 
 // ====================================================
-// RUN EVERY 5 MINUTES
+// RUN EVERY 30 MINUTES (48 runs/day)
 // ====================================================
 
 setInterval(
   syncCRM,
-  5 * 60 * 1000
+  SYNC_INTERVAL_MS
 );
