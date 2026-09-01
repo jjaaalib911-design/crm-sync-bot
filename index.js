@@ -55,27 +55,19 @@ const sheets = google.sheets({
 const REMINDER_WINDOW_DAYS = 3;
 const UNIQUE_KEY = 'Phone';
 
+
 // ====================================================
 // SYNC SCHEDULE
 //
 // Every 30 minutes -> 48 runs per day.
-// (Previously every 5 minutes -> 288 runs/day, which was
-// the main thing eating Railway's monthly usage allowance
-// and also made overlapping/parallel browser launches more
-// likely, which was contributing to the crash.)
 // ====================================================
 
 const SYNC_INTERVAL_MS = 30 * 60 * 1000;
 
-// How long a single sync is allowed to run before we give up
-// on it and let the next scheduled tick try again with a
-// fresh browser instance, instead of hanging forever.
-const SYNC_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+// Maximum time for one complete sync.
+const SYNC_TIMEOUT_MS = 4 * 60 * 1000;
 
-// Guards against a run being kicked off while a previous run
-// (browser launch, login, scraping) is still in progress.
-// Overlapping browser launches was one of the causes of the
-// "Resource temporarily unavailable" crash.
+// Prevent overlapping syncs.
 let isSyncing = false;
 
 
@@ -222,7 +214,7 @@ function formatDateForSheet(date) {
 // ====================================================
 // CALCULATE ACTIVE DATE
 //
-// Active Date = Expiry Date - 30 Days
+// Active Date = Expiry Date - 31 Days
 // ====================================================
 
 function calculateActiveDate(expiryDate) {
@@ -243,11 +235,6 @@ function calculateActiveDate(expiryDate) {
 // CALCULATE DAYS REMAINING
 //
 // Days Remaining = Expiry Date - TODAY
-//
-// Example:
-// Today  = 24-Aug-2026
-// Expiry = 02-Sep-2026
-// Result = 9
 // ====================================================
 
 function calculateDaysRemaining(expiryDate, today) {
@@ -316,8 +303,6 @@ function computeStatus(expiryDate, today) {
 // 7  = Package
 // 14 = Expiry Date
 //
-// row[21] is no longer used.
-// Active Date is calculated from Expiry Date.
 // ====================================================
 
 function extractRecord(row) {
@@ -474,6 +459,12 @@ async function callDataApi(page, body) {
           body: b,
         });
 
+      if (!res.ok) {
+        throw new Error(
+          `CRM API returned HTTP ${res.status}`
+        );
+      }
+
       return res.json();
 
     },
@@ -629,7 +620,7 @@ async function overwriteSheet(records) {
         // ----------------------------------------------
         // ACTIVE DATE
         //
-        // Expiry Date - 30 Days
+        // Expiry Date - 31 Days
         // ----------------------------------------------
 
         const activeDate =
@@ -658,8 +649,6 @@ async function overwriteSheet(records) {
 
         // ----------------------------------------------
         // STATUS + DAYS REMAINING
-        //
-        // Days Remaining = Expiry - Today
         // ----------------------------------------------
 
         const {
@@ -739,35 +728,13 @@ async function overwriteSheet(records) {
 
 
 // ====================================================
-// LAUNCH BROWSER (hardened against the EAGAIN / fork
-// crash seen in production)
-//
-// Key flags:
-//  --disable-dev-shm-usage   -> avoids Chrome using /dev/shm,
-//                               which is tiny/absent in most
-//                               containers and is a very common
-//                               source of crashes under load.
-//  --disable-crash-reporter,
-//  --disable-breakpad        -> skips spawning the crashpad
-//                               helper process entirely, which
-//                               is the exact subprocess that was
-//                               failing to fork with EAGAIN.
-//  --no-zygote                -> skips the zygote helper process,
-//                               reducing how many child processes
-//                               Chrome tries to fork on launch.
-//  --disable-gpu,
-//  --disable-software-rasterizer,
-//  --disable-extensions,
-//  --disable-background-networking,
-//  --no-first-run             -> trims extra Chrome subsystems
-//                               that aren't needed for headless
-//                               scraping, further reducing memory
-//                               and process-count pressure.
+// LAUNCH BROWSER
 // ====================================================
 
 async function launchBrowser() {
   return puppeteer.launch({
     headless: true,
+
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -787,10 +754,6 @@ async function launchBrowser() {
 
 // ====================================================
 // RUN WITH TIMEOUT
-//
-// Prevents a single sync from hanging forever (e.g. a CRM
-// page that never fires "networkidle2") and blocking every
-// future scheduled run behind it.
 // ====================================================
 
 function withTimeout(promise, ms, label) {
@@ -798,12 +761,177 @@ function withTimeout(promise, ms, label) {
 
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(
-      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      () => reject(
+        new Error(
+          `${label} timed out after ${ms}ms`
+        )
+      ),
       ms
     );
   });
 
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  return Promise.race([
+    promise,
+    timeout
+  ]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
+
+// ====================================================
+// ROBUST NAVIGATION
+//
+// IMPORTANT FIX:
+//
+// Old:
+// waitUntil: 'networkidle2'
+// timeout: 30000
+//
+// New:
+// waitUntil: 'domcontentloaded'
+// timeout: 120000
+//
+// Also retries navigation 3 times.
+//
+// This avoids the problem where CRM pages keep network
+// connections open and Puppeteer waits forever for
+// "networkidle2".
+// ====================================================
+
+const NAVIGATION_TIMEOUT_MS = 120 * 1000;
+const NAVIGATION_RETRIES = 3;
+
+
+async function safeGoto(page, url, label) {
+
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= NAVIGATION_RETRIES;
+    attempt++
+  ) {
+
+    try {
+
+      console.log(
+        `${label}: opening page (attempt ${attempt}/${NAVIGATION_RETRIES})...`
+      );
+
+
+      await page.goto(
+        url,
+        {
+          waitUntil: 'domcontentloaded',
+          timeout: NAVIGATION_TIMEOUT_MS
+        }
+      );
+
+
+      console.log(
+        `${label}: page loaded.`
+      );
+
+
+      return;
+
+    } catch (error) {
+
+      lastError = error;
+
+
+      console.error(
+        `${label}: navigation attempt ${attempt} failed: ${error.message}`
+      );
+
+
+      if (
+        attempt < NAVIGATION_RETRIES
+      ) {
+
+        console.log(
+          `${label}: waiting 5 seconds before retry...`
+        );
+
+
+        await new Promise(
+          resolve =>
+            setTimeout(
+              resolve,
+              5000
+            )
+        );
+
+      }
+
+    }
+  }
+
+
+  throw new Error(
+    `${label}: unable to load after ${NAVIGATION_RETRIES} attempts. Last error: ${lastError?.message || 'unknown error'}`
+  );
+}
+
+
+// ====================================================
+// WAIT FOR LOGIN RESULT
+//
+// We do NOT use waitForNavigation() here.
+//
+// Some modern CRM websites use AJAX/SPA login and therefore
+// may not trigger a normal browser navigation event.
+//
+// Instead, we wait until:
+// 1. Login form disappears, OR
+// 2. URL changes away from /login
+// ====================================================
+
+async function waitForLoginResult(page) {
+
+  await page.waitForFunction(
+
+    () => {
+
+      const url =
+        window.location.href.toLowerCase();
+
+
+      const usernameInput =
+        document.querySelector(
+          'input[name="username"], input[type="email"], input[name="email"]'
+        );
+
+
+      const passwordInput =
+        document.querySelector(
+          'input[name="password"], input[type="password"]'
+        );
+
+
+      // Login form disappeared.
+      if (
+        !usernameInput &&
+        !passwordInput
+      ) {
+        return true;
+      }
+
+
+      // URL changed away from login page.
+      return !url.includes('/login');
+
+    },
+
+    {
+      timeout:
+        NAVIGATION_TIMEOUT_MS,
+
+      polling:
+        500
+    }
+  );
 }
 
 
@@ -813,18 +941,27 @@ function withTimeout(promise, ms, label) {
 
 async function syncCRM() {
 
+  // --------------------------------------------------
+  // PREVENT OVERLAPPING SYNC
+  // --------------------------------------------------
+
   if (isSyncing) {
+
     console.log(
       `[${new Date().toISOString()}] Previous sync still running — skipping this tick.`
     );
+
     return;
   }
 
+
   isSyncing = true;
+
 
   console.log(
     `[${new Date().toISOString()}] Sync started...`
   );
+
 
   let browser = null;
 
@@ -832,17 +969,33 @@ async function syncCRM() {
   try {
 
     await withTimeout(
+
       (async () => {
+
 
         // =================================================
         // LAUNCH BROWSER
         // =================================================
 
-        browser = await launchBrowser();
+        browser =
+          await launchBrowser();
 
 
         const page =
           await browser.newPage();
+
+
+        // =================================================
+        // DEFAULT PUPPETEER TIMEOUTS
+        // =================================================
+
+        page.setDefaultNavigationTimeout(
+          NAVIGATION_TIMEOUT_MS
+        );
+
+        page.setDefaultTimeout(
+          NAVIGATION_TIMEOUT_MS
+        );
 
 
         await page.setViewport({
@@ -860,17 +1013,69 @@ async function syncCRM() {
         );
 
 
-        await page.goto(
+        // -------------------------------------------------
+        // OPEN LOGIN PAGE
+        // -------------------------------------------------
+
+        await safeGoto(
+          page,
           CRM_LOGIN_URL,
-          {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          }
+          'CRM login'
         );
 
 
+        // -------------------------------------------------
+        // WAIT FOR USERNAME FIELD
+        // -------------------------------------------------
+
+        await page.waitForSelector(
+
+          'input[name="username"], input[type="email"], input[name="email"]',
+
+          {
+            timeout:
+              NAVIGATION_TIMEOUT_MS
+          }
+
+        );
+
+
+        // -------------------------------------------------
+        // FIND USERNAME SELECTOR
+        // -------------------------------------------------
+
+        const usernameSelector =
+          await page.$(
+            'input[name="username"]'
+          )
+            ? 'input[name="username"]'
+            : (
+                await page.$(
+                  'input[type="email"]'
+                )
+                  ? 'input[type="email"]'
+                  : 'input[name="email"]'
+              );
+
+
+        // -------------------------------------------------
+        // FIND PASSWORD SELECTOR
+        // -------------------------------------------------
+
+        const passwordSelector =
+          await page.$(
+            'input[name="password"]'
+          )
+            ? 'input[name="password"]'
+            : 'input[type="password"]';
+
+
+        // -------------------------------------------------
+        // TYPE USERNAME
+        // -------------------------------------------------
+
         await page.type(
-          'input[name="username"]',
+          usernameSelector,
           CRM_USERNAME,
           {
             delay: 30
@@ -878,8 +1083,12 @@ async function syncCRM() {
         );
 
 
+        // -------------------------------------------------
+        // TYPE PASSWORD
+        // -------------------------------------------------
+
         await page.type(
-          'input[name="password"]',
+          passwordSelector,
           CRM_PASSWORD,
           {
             delay: 30
@@ -887,18 +1096,38 @@ async function syncCRM() {
         );
 
 
-        await Promise.all([
+        // -------------------------------------------------
+        // FIND SUBMIT BUTTON
+        // -------------------------------------------------
 
-          page.click(
+        const submitSelector =
+          await page.$(
             'button[type="submit"]'
-          ),
+          )
+            ? 'button[type="submit"]'
+            : 'input[type="submit"]';
 
-          page.waitForNavigation({
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          }),
 
-        ]);
+        // -------------------------------------------------
+        // CLICK LOGIN
+        //
+        // IMPORTANT:
+        // We no longer use Promise.all() with
+        // page.waitForNavigation().
+        // -------------------------------------------------
+
+        await page.click(
+          submitSelector
+        );
+
+
+        // -------------------------------------------------
+        // WAIT FOR LOGIN RESULT
+        // -------------------------------------------------
+
+        await waitForLoginResult(
+          page
+        );
 
 
         console.log(
@@ -915,12 +1144,10 @@ async function syncCRM() {
         );
 
 
-        await page.goto(
+        await safeGoto(
+          page,
           CRM_LIST_PAGE_URL,
-          {
-            waitUntil: 'networkidle2',
-            timeout: 30000
-          }
+          'Customer list'
         );
 
 
@@ -980,12 +1207,18 @@ async function syncCRM() {
         );
 
 
+        // -------------------------------------------------
+        // CHECK DATA
+        // -------------------------------------------------
+
         if (
           rawRows.length === 0
         ) {
+
           throw new Error(
             'No records returned even after testing filter types.'
           );
+
         }
 
 
@@ -1028,9 +1261,13 @@ async function syncCRM() {
           `[${new Date().toISOString()}] Sync completed.`
         );
 
+
       })(),
+
       SYNC_TIMEOUT_MS,
+
       'Sync'
+
     );
 
 
@@ -1044,13 +1281,28 @@ async function syncCRM() {
 
   } finally {
 
+
+    // =================================================
+    // CLOSE BROWSER
+    // =================================================
+
     if (browser) {
+
       try {
+
         await browser.close();
+
       } catch (closeErr) {
-        console.error('Error while closing browser:', closeErr.message);
+
+        console.error(
+          'Error while closing browser:',
+          closeErr.message
+        );
+
       }
+
     }
+
 
     isSyncing = false;
 
@@ -1060,25 +1312,46 @@ async function syncCRM() {
 
 // ====================================================
 // PROCESS-LEVEL SAFETY NETS
-//
-// A single unexpected rejection/exception (e.g. Google Sheets
-// API hiccup, CRM page throwing mid-scrape) should never take
-// the whole bot down — just log it and let the next scheduled
-// sync try again.
 // ====================================================
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
-});
+process.on(
+  'unhandledRejection',
+  (reason) => {
 
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err.message);
-});
+    console.error(
+      'Unhandled promise rejection:',
+      reason
+    );
 
-process.on('SIGTERM', () => {
-  console.log('Received SIGTERM — shutting down gracefully.');
-  process.exit(0);
-});
+  }
+);
+
+
+process.on(
+  'uncaughtException',
+  (err) => {
+
+    console.error(
+      'Uncaught exception:',
+      err.message
+    );
+
+  }
+);
+
+
+process.on(
+  'SIGTERM',
+  () => {
+
+    console.log(
+      'Received SIGTERM — shutting down gracefully.'
+    );
+
+    process.exit(0);
+
+  }
+);
 
 
 // ====================================================
@@ -1089,11 +1362,17 @@ console.log(
   'CRM Sync Bot starting...'
 );
 
+
+console.log(
+  `Navigation timeout: ${NAVIGATION_TIMEOUT_MS / 1000}s | Navigation retries: ${NAVIGATION_RETRIES}`
+);
+
+
 syncCRM();
 
 
 // ====================================================
-// RUN EVERY 30 MINUTES (48 runs/day)
+// RUN EVERY 30 MINUTES
 // ====================================================
 
 setInterval(
